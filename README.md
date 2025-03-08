@@ -153,4 +153,18 @@ To add new functionality:
 
 ## License
 
-MIT 
+MIT
+
+## Deployment
+
+### Railway Deployment
+
+This project can be deployed to Railway using GitHub integration. For detailed instructions, see the [Railway Deployment Guide](RAILWAY_DEPLOYMENT.md).
+
+Quick steps:
+1. Push your code to GitHub
+2. Set up a new project in Railway from your GitHub repository
+3. Configure environment variables in the Railway dashboard
+4. Railway will automatically build and deploy your application
+
+For local development, use the `.env` file. For Railway, configure variables in the Railway dashboard. 
