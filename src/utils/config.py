@@ -9,8 +9,10 @@ DB_API_URL = os.getenv('DB_API_URL', 'https://3ea5d3427422.ngrok.app/api/db')
 BLOCKCHAIN_API_URL = os.getenv('BLOCKCHAIN_API_URL', '')
 
 # Configuración del WebSocket
+# En Railway, necesitamos usar 0.0.0.0 para el host y la variable PORT que Railway proporciona
 WS_HOST = os.getenv('WS_HOST', 'localhost')
-WS_PORT = int(os.getenv('WS_PORT', '8765'))
+# Asegúrate de que el puerto es un entero y usa el PORT de Railway si está disponible
+WS_PORT = int(os.getenv('PORT', os.getenv('WS_PORT', '8765')))
 
 # Configuración del agente
 AGENT_CHECK_INTERVAL = int(os.getenv('AGENT_CHECK_INTERVAL', '60'))  # segundos

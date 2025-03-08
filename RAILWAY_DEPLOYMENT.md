@@ -25,7 +25,8 @@ After deployment, set up your environment variables in the Railway dashboard:
 1. Go to your project in the Railway dashboard
 2. Navigate to the "Variables" tab
 3. Add the necessary environment variables from your `.env.railway` file
-   - Make sure to set `WS_HOST=0.0.0.0` and `WS_PORT=$PORT`
+   - Make sure to set `WS_HOST=0.0.0.0` to allow external connections
+   - Railway automatically sets the `PORT` variable, which our code now uses directly
    - Add your `OPENAI_API_KEY` and any other required variables
    - If using a database, configure those variables as well
 
@@ -46,6 +47,24 @@ After deployment, set up your environment variables in the Railway dashboard:
 By default, Railway will automatically deploy new changes when you push to your GitHub repository.
 
 ## Troubleshooting
+
+### Connection Refused Errors
+
+If you see a 502 Bad Gateway error with a message like "failed to forward request to upstream: connection refused", check the following:
+
+1. Verify that your code is correctly using the `PORT` environment variable that Railway provides:
+   - We've updated the `config.py` file to prioritize the `PORT` environment variable over `WS_PORT`
+   - The WebSocket server should be binding to `0.0.0.0` and the Railway-provided port
+
+2. Check the logs for any errors during server startup
+   - If the server is crashing, fix the underlying issue
+   - If the WebSocket server is not binding correctly, update the configuration
+
+3. Ensure your deployment is up to date:
+   - Railway automatically redeploys when you push to GitHub
+   - You can also manually trigger a new deployment from the dashboard
+
+### Other Common Issues
 
 - If the deployment fails, check the logs for error messages
 - Ensure all required environment variables are properly set
