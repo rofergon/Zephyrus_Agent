@@ -31,30 +31,38 @@ Attempt #3 failed with service unavailable. Continuing to retry for 4m46s
 ### Causa raíz
 Railway espera que tu aplicación responda a solicitudes HTTP en la ruta "/" para verificar que está funcionando correctamente, pero los servidores WebSocket puros no suelen responder a estas solicitudes.
 
+## Problema 3: Conflicto de puertos
+
+Después de implementar una solución inicial, nos encontramos con un nuevo problema:
+
+```
+Error starting WebSocket server: [Errno 98] error while attempting to bind on address ('0.0.0.0', 8080): [errno 98] address already in use
+```
+
+### Causa raíz
+Nuestro enfoque anterior ejecutaba el servidor HTTP y el servidor WebSocket como procesos separados, ambos intentando usar el mismo puerto (8080), lo que causaba un conflicto.
+
 ## La solución implementada
 
-Hemos realizado las siguientes modificaciones para solucionar ambos problemas:
+Hemos realizado las siguientes modificaciones para solucionar todos estos problemas:
 
-### 1. Script de patch con servidor HTTP (src/railway_patch.py)
+### 1. Servidor integrado HTTP+WebSocket (src/railway_patch.py)
 
-- Fuerza las variables de entorno correctas (WS_HOST=0.0.0.0)
-- Implementa un servidor HTTP simple usando aiohttp para responder a los healthchecks
-- Ejecuta el servidor HTTP en un hilo separado para no interferir con el WebSocket
-- Inicia la aplicación principal en el hilo principal
+En lugar de ejecutar dos servidores separados, ahora:
+- Implementamos un único servidor aiohttp que maneja tanto HTTP como WebSocket
+- Las rutas HTTP ('/' y '/health') responden a los healthchecks de Railway
+- La ruta WebSocket ('/ws/agent/{agent_id}') maneja las conexiones WebSocket
+- Todo funciona en el mismo puerto, sin conflictos
 
-### 2. Modificación en WebSocketServer
+### 2. Modificación en cómo se inicia la aplicación
 
-- Detecta automáticamente si estamos en Railway
-- Fuerza el host a 0.0.0.0 en entornos Railway
-- Añade logging extensivo para diagnóstico
+- Ahora usamos la aplicación aiohttp como punto de entrada principal
+- Inicializamos el AgentManager dentro de esta aplicación
+- Integramos el WebSocketServer con aiohttp en lugar de ejecutarlo por separado
 
-### 3. Modificación en el servicio de ejecución de agentes
+### 3. Configuración de Railway actualizada
 
-- Aplica la misma lógica para forzar 0.0.0.0 en Railway
-
-### 4. Configuración de Railway actualizada
-
-- Actualizado railway.toml y railway.json para usar el script de inicio correcto
+- Configuración para usar el script de inicio correcto
 
 ## Cómo verificar que funciona
 
@@ -62,35 +70,27 @@ Después del despliegue, busca en los logs estas líneas:
 
 ```
 [RAILWAY PATCH] Forzando WS_HOST=0.0.0.0 y WS_PORT=8080
-[RAILWAY HEALTHCHECK] Iniciando servidor HTTP para healthcheck en http://0.0.0.0:8080
-[RAILWAY PATCH] Servidor HTTP para healthcheck iniciado en un hilo separado
-[RAILWAY PATCH] Iniciando aplicación principal...
+[RAILWAY INTEGRATED SERVER] Iniciando servidor HTTP+WebSocket en http://0.0.0.0:8080
 ```
 
-Y luego:
-```
-Detectado entorno Railway, forzando host a 0.0.0.0
-INICIANDO EN: ws://0.0.0.0:8080
-WebSocket server started on ws://0.0.0.0:8080
-```
+Y deberías ver que el healthcheck pasa correctamente.
 
-## Otros posibles problemas
+## Cómo funciona la integración
 
-Si después de estos cambios sigues teniendo problemas, considera:
+1. **Un único servidor**:
+   - En lugar de ejecutar dos servidores separados que compiten por el mismo puerto, ahora usamos un solo servidor aiohttp
+   - Este servidor maneja tanto las solicitudes HTTP como las conexiones WebSocket
 
-1. **Conflicto de puertos**: 
-   - El servidor HTTP y WebSocket ahora comparten el mismo puerto
-   - Esto debería funcionar correctamente, pero podría causar problemas en algunos casos
+2. **Rutas diferenciadas**:
+   - Rutas HTTP: '/' y '/health' para el healthcheck
+   - Ruta WebSocket: '/ws/agent/{agent_id}' para las conexiones WebSocket
 
-2. **Problemas de arranque**:
-   - Si la aplicación no inicia correctamente, revisa los logs para más detalles
-   - Railway puede terminar el proceso si tarda demasiado en iniciar
-
-3. **Configuración de rutas WebSocket en Railway**:
-   - Asegúrate de que las rutas en railway.toml son correctas
+3. **Sin conflictos de puerto**:
+   - Aiohttp puede manejar ambos protocolos (HTTP y WebSocket) en el mismo puerto
+   - Railway hace el healthcheck HTTP a '/' y los clientes se conectan al WebSocket en '/ws/agent/{agent_id}'
 
 ## Recursos útiles
 
 - [Documentación sobre healthchecks en Railway](https://docs.railway.app/deploy/deployments#healthchecks)
-- [Buenas prácticas para WebSockets en contenedores](https://devcenter.heroku.com/articles/websockets#websockets-with-node-js)
+- [Soporte de WebSocket en aiohttp](https://docs.aiohttp.org/en/stable/web_quickstart.html#websockets)
 - [FAQ sobre redes en Railway](https://docs.railway.app/faq) 
