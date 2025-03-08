@@ -4,6 +4,7 @@ from typing import Dict, Set, List, Optional, Tuple
 import uuid
 import asyncio
 from datetime import datetime
+import os
 
 import websockets
 from websockets.exceptions import ConnectionClosedError
@@ -19,8 +20,19 @@ logger = setup_logger(__name__)
 
 class WebSocketServer:
     def __init__(self, agent_manager: AgentManager):
+        # Usar el WS_HOST de la configuración
         self.host = WS_HOST
-        self.port = WS_PORT
+        
+        # Obtener puerto directamente de la variable PORT de Railway si está disponible
+        # o usar WS_PORT de la configuración como respaldo
+        railway_port = os.environ.get('PORT')
+        if railway_port:
+            self.port = int(railway_port)
+            logger.info(f"Usando el puerto de Railway: {self.port}")
+        else:
+            self.port = WS_PORT
+            logger.info(f"Usando el puerto de configuración: {self.port}")
+            
         self.agent_manager = agent_manager
         self.clients = {}  # {websocket: path}
         self.running = False
@@ -945,6 +957,10 @@ class WebSocketServer:
         Inicia el servidor WebSocket
         """
         try:
+            # Registrar información adicional para depuración
+            logger.info(f"Iniciando servidor WebSocket en host={self.host} puerto={self.port}")
+            logger.info(f"Variables de entorno: PORT={os.environ.get('PORT')}, WS_PORT={os.environ.get('WS_PORT')}")
+            
             self.server = await websockets.serve(
                 self.ws_handler,
                 self.host,

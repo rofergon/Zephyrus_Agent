@@ -226,13 +226,21 @@ async def start_server():
     Inicia el servidor WebSocket para la ejecución de agentes.
     """
     try:
+        # Obtener el puerto directamente de la variable PORT de Railway si está disponible
+        port = int(os.environ.get('PORT', WS_PORT))
+        host = os.environ.get('WS_HOST', WS_HOST)
+        
+        # Registrar información para depuración
+        logger.info(f"Iniciando servidor WebSocket en host={host} puerto={port}")
+        logger.info(f"Variables de entorno: PORT={os.environ.get('PORT')}, WS_PORT={os.environ.get('WS_PORT')}")
+        
         server = await websockets.serve(
             handle_websocket_connection, 
-            WS_HOST, 
-            WS_PORT
+            host, 
+            port
         )
         
-        logger.info(f"Servidor WebSocket para ejecución de agentes iniciado en {WS_HOST}:{WS_PORT}")
+        logger.info(f"Servidor WebSocket para ejecución de agentes iniciado en {host}:{port}")
         
         # Mantener el servidor en ejecución
         await server.wait_closed()
