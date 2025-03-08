@@ -1,18 +1,27 @@
-# Integración de WebSocket con aiohttp para Railway
+# Integración de HTTP y WebSocket con aiohttp para Railway
 
-Este documento explica cómo hemos integrado nuestro servidor WebSocket con aiohttp para resolver problemas de despliegue en Railway.
+Este documento explica cómo hemos integrado un servidor HTTP y WebSocket usando aiohttp para solucionar problemas de despliegue en Railway.
 
-## Problema
+## ¿Por qué aiohttp?
 
-Railway requiere un servidor HTTP para realizar healthchecks, pero nuestra aplicación era originalmente un servidor WebSocket puro. Al intentar ejecutar ambos servidores en el mismo puerto, obtuvimos un error:
+Elegimos aiohttp por varias razones:
 
-```
-Error starting WebSocket server: [Errno 98] error while attempting to bind on address ('0.0.0.0', 8080): [errno 98] address already in use
-```
+1. **Soporte nativo para HTTP y WebSocket**: Permite manejar ambos protocolos desde una única aplicación
+2. **Basado en asyncio**: Compatible con el enfoque asíncrono de nuestra aplicación existente
+3. **Ligero y eficiente**: Consumo de recursos reducido
+4. **Amplia adopción**: Biblioteca madura y bien documentada
 
-## Solución: Integración con aiohttp
+## Estructura de la integración
 
-En lugar de ejecutar dos servidores separados, hemos integrado el servidor WebSocket dentro de una aplicación aiohttp:
+La integración se realiza en tres capas:
+
+1. **Capa de servidor**: Aplicación aiohttp que escucha en el puerto asignado por Railway
+2. **Capa de adaptación**: WebSocketAdapter que hace compatible aiohttp con el código existente
+3. **Capa de lógica**: Código original de WebSocketServer, AgentManager, etc.
+
+## Código de la integración
+
+### 1. Creación de la aplicación
 
 ```python
 # Creamos la aplicación aiohttp
@@ -22,83 +31,93 @@ app = web.Application()
 app.router.add_get('/', handle_healthcheck)
 app.router.add_get('/health', handle_healthcheck)
 
-# Creamos una instancia del WebSocketServer
-ws_server = WebSocketServer(agent_manager)
+# Obtenemos el puerto de Railway
+port = int(os.environ.get('PORT', '8080'))
+```
 
-# Añadimos un manejador para las conexiones WebSocket
+### 2. Manejadores de rutas
+
+```python
+# Healthcheck para Railway
+async def handle_healthcheck(request):
+    return web.Response(text="OK", status=200)
+
+# Manejador de WebSocket
 async def handle_websocket(request):
     ws = web.WebSocketResponse()
     await ws.prepare(request)
     
-    # Registrar el websocket
-    await ws_server.register(ws)
+    # Creamos un adaptador para hacer compatible la interfaz
+    adapter = WebSocketAdapter(ws)
+    
+    # Registrar el websocket usando el adaptador
+    await ws_server.register(adapter)
+    
+    # Extraer el agent_id de la URL
+    agent_id = request.match_info.get('agent_id', 'unknown')
     
     try:
         async for msg in ws:
             if msg.type == web.WSMsgType.TEXT:
-                await ws_server.handle_message(ws, msg.data)
+                # Usar el adaptador para manejar mensajes
+                await ws_server.handle_message(adapter, msg.data)
             elif msg.type == web.WSMsgType.ERROR:
                 print(f'WebSocket connection closed with exception {ws.exception()}')
     finally:
-        await ws_server.unregister(ws)
+        # Usamos el adaptador para desregistrar
+        await ws_server.unregister(adapter)
         
     return ws
-
-# Añadimos la ruta WebSocket
-app.router.add_get('/ws/agent/{agent_id}', handle_websocket)
 ```
 
-## Cómo funciona
-
-### 1. Manejador de HTTP para healthchecks
+### 3. Inicialización y ejecución
 
 ```python
-async def handle_healthcheck(request):
-    return web.Response(text="OK", status=200)
+# Añadimos la ruta WebSocket
+app.router.add_get('/ws/agent/{agent_id}', handle_websocket)
+
+# Iniciamos el servidor
+runner = web.AppRunner(app)
+await runner.setup()
+site = web.TCPSite(runner, '0.0.0.0', port)
+
+print(f"[RAILWAY INTEGRATED SERVER] Iniciando servidor HTTP+WebSocket en http://0.0.0.0:{port}")
+await site.start()
+
+# Mantener el servidor en ejecución
+while True:
+    await asyncio.sleep(3600)
 ```
 
-Este manejador responde a las solicitudes HTTP a '/' y '/health' con un simple "OK", permitiendo que Railway verifique que la aplicación está funcionando correctamente.
+## Ventajas de este enfoque
 
-### 2. Manejador de WebSocket
+1. **Un solo servidor**: Elimina el conflicto de puertos
+2. **Healthchecks funcionales**: Railway puede verificar que la aplicación está viva
+3. **Rutas diferenciadas**: 
+   - '/' y '/health' para healthchecks
+   - '/ws/agent/{agent_id}' para WebSockets
+4. **Sin modificaciones en el código original**: Gracias al adaptador
 
-El manejador de WebSocket realiza las siguientes acciones:
-1. Crea un objeto `WebSocketResponse` para manejar la comunicación
-2. Registra la conexión con nuestro `WebSocketServer` existente
-3. Procesa los mensajes recibidos del cliente y los pasa a nuestro `handle_message` existente
-4. Desregistra la conexión cuando se cierra
+## Consideraciones importantes
 
-### 3. Estructura de rutas
-
-- **Rutas HTTP**: '/' y '/health' para los healthchecks
-- **Ruta WebSocket**: '/ws/agent/{agent_id}' para las conexiones WebSocket
-
-## Adaptaciones necesarias
-
-Para que esta integración funcione, hemos tenido que adaptar cómo interactuamos con las conexiones WebSocket:
-
-1. **Compatibilidad con aiohttp**: Ahora usamos objetos `WebSocketResponse` de aiohttp en lugar de objetos `WebSocketServerProtocol` de websockets
-2. **Manejo de mensajes**: Procesamos los mensajes dentro del handler de aiohttp
-3. **Uso del parámetro agent_id**: Extraemos el ID del agente directamente de la URL
-
-## Beneficios
-
-Esta integración nos proporciona varias ventajas:
-
-1. **Un solo servidor**: Eliminamos el conflicto de puertos
-2. **Healthchecks funcionales**: Railway puede verificar correctamente que nuestra aplicación está viva
-3. **Integración limpia**: No necesitamos hilos separados ni procesos adicionales
-
-## Actualización del frontend
-
-Si estabas conectándote al servidor WebSocket usando una URL como:
+### URL para conectarse
 
 ```
 wss://zephyrusagent-production.up.railway.app/ws/agent/TU_ID_DE_AGENTE
 ```
 
-Esa URL seguirá funcionando con esta nueva implementación, no es necesario cambiar nada en el frontend.
+Puntos importantes:
+- Usar `wss://` (WebSocket Seguro) en producción
+- No especificar puerto en la URL
+
+### Mensajes y formato de datos
+
+El adaptador WebSocket maneja automáticamente la conversión de formatos:
+- JSON para estructuras de datos
+- Texto para mensajes simples
 
 ## Referencias
 
-- [Documentación de WebSockets en aiohttp](https://docs.aiohttp.org/en/stable/web_quickstart.html#websockets)
-- [Guía de WebSockets en Railway](https://docs.railway.app/guides/websockets) 
+- [Documentación de aiohttp sobre WebSockets](https://docs.aiohttp.org/en/stable/web_quickstart.html#websockets)
+- [Guía de Railway sobre servidores web](https://docs.railway.app/deploy/exposing-your-app)
+- [FAQ de Railway sobre puertos](https://docs.railway.app/reference/public-networking#port-selection) 
