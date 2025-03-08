@@ -16,14 +16,16 @@ httpStatus: 502
 upstreamProto: "HTTP/1.1"
 downstreamProto: "HTTP/1.1"
 responseDetails: "failed to forward request to upstream: connection refused"
-upstreamAddress: "http://[fd12:b97:efb:0:2000:7:7d7f:79f8]:8765"
+upstreamAddress: "http://[fd12:b97:efb:0:2000:3c:1517:a75c]:8765"
 ```
 
 Esto indica que Railway está intentando enrutar las solicitudes WebSocket a tu aplicación, pero el puerto específico (8765) no está disponible o no está correctamente configurado.
 
 ## La Solución (Implementada)
 
-Hemos realizado la siguiente modificación en `src/utils/config.py`:
+Hemos realizado las siguientes modificaciones para solucionar este problema:
+
+### 1. Modificación en `src/utils/config.py`:
 
 ```python
 # Antes:
@@ -33,30 +35,64 @@ WS_PORT = int(os.getenv('WS_PORT', '8765'))
 WS_PORT = int(os.getenv('PORT', os.getenv('WS_PORT', '8765')))
 ```
 
-Este cambio hace que la aplicación:
-1. Primero busque la variable `PORT` que Railway proporciona automáticamente
-2. Si no encuentra `PORT`, utiliza el valor de `WS_PORT` 
-3. Si ninguno está definido, usa el puerto predeterminado 8765
+### 2. Modificación en `src/websocket/websocket_server.py`:
+
+Hemos modificado la clase WebSocketServer para obtener el puerto directamente de la variable de entorno PORT:
+
+```python
+def __init__(self, agent_manager: AgentManager):
+    # Usar el WS_HOST de la configuración
+    self.host = WS_HOST
+    
+    # Obtener puerto directamente de la variable PORT de Railway si está disponible
+    # o usar WS_PORT de la configuración como respaldo
+    railway_port = os.environ.get('PORT')
+    if railway_port:
+        self.port = int(railway_port)
+        logger.info(f"Usando el puerto de Railway: {self.port}")
+    else:
+        self.port = WS_PORT
+        logger.info(f"Usando el puerto de configuración: {self.port}")
+```
+
+### 3. Modificación en `src/services/agent_execution_service.py`:
+
+También hemos actualizado el servicio de ejecución de agentes para usar el puerto correcto:
+
+```python
+# Obtener el puerto directamente de la variable PORT de Railway si está disponible
+port = int(os.environ.get('PORT', WS_PORT))
+host = os.environ.get('WS_HOST', WS_HOST)
+```
 
 ## Verificación
 
 Después de implementar estos cambios y volver a desplegar la aplicación:
 
 1. Verifica los logs de Railway para asegurarte de que el servidor se inicia correctamente
-2. Busca un mensaje similar a: `WebSocket server started on ws://0.0.0.0:XXXX` (donde XXXX será el puerto asignado por Railway)
+2. Busca mensajes como:
+   - `Usando el puerto de Railway: XXXX`
+   - `WebSocket server started on ws://0.0.0.0:XXXX`
+   - `Variables de entorno: PORT=XXXX, WS_PORT=YYYY`
 3. Intenta conectarte nuevamente a tu WebSocket
 
 ## Si el Problema Persiste
 
 Si el problema persiste después de aplicar estos cambios:
 
-1. **Verifica los logs de Railway**: Busca errores específicos durante el inicio del servidor
-2. **Modifica el archivo principal**: Asegúrate de que el `Procfile` esté correctamente configurado:
-   ```
-   web: python src/main.py
-   ```
-3. **Comprueba las variables de entorno en Railway**: Asegúrate de que están correctamente configuradas
-4. **Fuerza un reinicio**: A veces, reiniciar el servicio desde el dashboard de Railway puede resolver problemas de inicialización
+1. **Fuerza un reinicio completo de Railway**:
+   - Ve al dashboard de Railway
+   - Selecciona tu aplicación
+   - Navega a la sección "Deployments"
+   - Haz clic en "Redeploy" para forzar un nuevo despliegue completo
+
+2. **Verifica que los logs muestren el puerto correcto**:
+   - Deberías ver un mensaje como "Usando el puerto de Railway: XXXX" en los logs
+   - Confirma que el puerto que muestra coincide con el que Railway está intentando usar
+
+3. **Prueba con una configuración manual del dominio WebSocket**:
+   - En tu cliente WebSocket, asegúrate de estar usando la URL correcta
+   - El formato correcto sería: `wss://zephyrusagent-production.up.railway.app/ws/agent/TU_ID_DE_AGENTE`
 
 ## Otros Archivos Relevantes
 
@@ -64,7 +100,8 @@ Si necesitas hacer más depuración, estos son los archivos principales relacion
 
 1. `src/utils/config.py` - Configuración de host y puerto
 2. `src/websocket/websocket_server.py` - Implementación del servidor WebSocket
-3. `src/main.py` - Punto de entrada principal que inicia el servidor
+3. `src/services/agent_execution_service.py` - Servicio de ejecución de agentes
+4. `src/main.py` - Punto de entrada principal que inicia el servidor
 
 ## Recursos Adicionales
 
