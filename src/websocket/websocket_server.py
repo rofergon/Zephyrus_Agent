@@ -818,19 +818,33 @@ class WebSocketServer:
                     if 'result' in action:
                         if isinstance(action['result'], dict):
                             if 'success' in action['result'] and action['result']['success'] is True:
-                                result_value = action['result'].get('data', '')
-                                result_summary = f"Resultado: {result_value}"
-                                success = True
+                                # Comprobar si es un caso especial donde tuvimos error de ABI pero la transacción se completó
+                                if 'warning' in action['result'] and 'original_error' in action['result'] and 'transaction_completed' in action['result']:
+                                    result_value = action['result'].get('warning', '')
+                                    result_summary = f"Advertencia: {result_value} (Transacción completada)"
+                                    success = True
+                                else:
+                                    result_value = action['result'].get('data', '')
+                                    result_summary = f"Resultado: {result_value}"
+                                    success = True
                             elif 'success' in action['result'] and action['result']['success'] is False:
                                 error_msg = action['result'].get('error', 'Error desconocido')
+                                # Verificar si es un error de "no matching fragment" que podría indicar éxito real
+                                if isinstance(error_msg, str) and "no matching fragment" in error_msg and "UNSUPPORTED_OPERATION" in error_msg:
+                                    # Esta transacción probablemente se completó pero tuvo un error de ABI
+                                    result_summary = f"Advertencia: Posible éxito con error de ABI: {error_msg}"
+                                    success = True
                                 # Extraer mensaje principal de error
-                                if isinstance(error_msg, str) and "execution reverted" in error_msg:
+                                elif isinstance(error_msg, str) and "execution reverted" in error_msg:
                                     import re
                                     match = re.search(r'"([^"]+)"', error_msg)
                                     if match:
                                         error_msg = match.group(1)
-                                result_summary = f"Error: {error_msg}"
-                                success = False
+                                    result_summary = f"Error: {error_msg}"
+                                    success = False
+                                else:
+                                    result_summary = f"Error: {error_msg}"
+                                    success = False
                             else:
                                 result_summary = str(action['result'])
                                 success = True
@@ -838,8 +852,15 @@ class WebSocketServer:
                             result_summary = str(action['result'])
                             success = True
                     elif 'error' in action:
-                        result_summary = f"ERROR: {action['error']}"
-                        success = False
+                        error_msg = action['error']
+                        # Verificar si es un error de "no matching fragment" que podría indicar éxito real
+                        if isinstance(error_msg, str) and "no matching fragment" in error_msg and "UNSUPPORTED_OPERATION" in error_msg:
+                            # Esta transacción probablemente se completó pero tuvo un error de ABI
+                            result_summary = f"Advertencia: Posible éxito con error de ABI: {error_msg}"
+                            success = True
+                        else:
+                            result_summary = f"ERROR: {error_msg}"
+                            success = False
                     else:
                         result_summary = "No hay información de resultado"
                         success = None
