@@ -1,32 +1,46 @@
-# Solucionando el problema de host en Railway (localhost vs 0.0.0.0)
+# Solucionando problemas de Railway: Host y Healthcheck
 
-## El problema
+## Problema 1: Host incorrecto (localhost vs 0.0.0.0)
 
-Los logs muestran el siguiente problema:
+Los logs mostraban el siguiente problema:
 
 ```
 Iniciando servidor WebSocket en host=localhost puerto=8080
 WebSocket server started on ws://localhost:8080
 ```
 
-Pero Railway intenta conectar a:
+Pero Railway intentaba conectar a:
 ```
 upstreamAddress: "http://[fd12:b97:efb:0:2000:41:2c46:de16]:8080"
 responseDetails: "failed to forward request to upstream: connection refused"
 ```
 
-## La causa raíz
-
+### Causa raíz
 El problema es que Railway necesita que tu aplicación escuche en todas las interfaces de red (`0.0.0.0`) y no solo en `localhost` (127.0.0.1), que solo acepta conexiones desde la misma máquina.
+
+## Problema 2: Fallos en el Healthcheck
+
+El segundo problema identificado es que Railway realiza un healthcheck a la ruta "/" y espera una respuesta HTTP, pero nuestra aplicación es solo un servidor WebSocket y no responde a solicitudes HTTP estándar:
+
+```
+Attempt #1 failed with service unavailable. Continuing to retry for 4m49s
+Attempt #2 failed with service unavailable. Continuing to retry for 4m48s
+Attempt #3 failed with service unavailable. Continuing to retry for 4m46s
+```
+
+### Causa raíz
+Railway espera que tu aplicación responda a solicitudes HTTP en la ruta "/" para verificar que está funcionando correctamente, pero los servidores WebSocket puros no suelen responder a estas solicitudes.
 
 ## La solución implementada
 
-Hemos realizado las siguientes modificaciones para solucionar este problema:
+Hemos realizado las siguientes modificaciones para solucionar ambos problemas:
 
-### 1. Script de inicio específico para Railway (src/railway_starter.py)
+### 1. Script de patch con servidor HTTP (src/railway_patch.py)
 
-- Crea un archivo de patch (src/railway_patch.py) que fuerza las variables de entorno correctas
-- Asegura que WS_HOST sea siempre 0.0.0.0 en Railway
+- Fuerza las variables de entorno correctas (WS_HOST=0.0.0.0)
+- Implementa un servidor HTTP simple usando aiohttp para responder a los healthchecks
+- Ejecuta el servidor HTTP en un hilo separado para no interferir con el WebSocket
+- Inicia la aplicación principal en el hilo principal
 
 ### 2. Modificación en WebSocketServer
 
@@ -47,8 +61,16 @@ Hemos realizado las siguientes modificaciones para solucionar este problema:
 Después del despliegue, busca en los logs estas líneas:
 
 ```
+[RAILWAY PATCH] Forzando WS_HOST=0.0.0.0 y WS_PORT=8080
+[RAILWAY HEALTHCHECK] Iniciando servidor HTTP para healthcheck en http://0.0.0.0:8080
+[RAILWAY PATCH] Servidor HTTP para healthcheck iniciado en un hilo separado
+[RAILWAY PATCH] Iniciando aplicación principal...
+```
+
+Y luego:
+```
 Detectado entorno Railway, forzando host a 0.0.0.0
-INICIANDO EN: ws://0.0.0.0:8080 - Asegúrate de que esto sea 0.0.0.0 en Railway
+INICIANDO EN: ws://0.0.0.0:8080
 WebSocket server started on ws://0.0.0.0:8080
 ```
 
@@ -56,18 +78,19 @@ WebSocket server started on ws://0.0.0.0:8080
 
 Si después de estos cambios sigues teniendo problemas, considera:
 
-1. **Problemas de red interna en Railway**: 
-   - Railway usa una red interna con direcciones IPv6 como se ve en el error
-   - Puede ser necesario contactar al soporte de Railway
+1. **Conflicto de puertos**: 
+   - El servidor HTTP y WebSocket ahora comparten el mismo puerto
+   - Esto debería funcionar correctamente, pero podría causar problemas en algunos casos
 
-2. **Configuración de rutas WebSocket en Railway**:
+2. **Problemas de arranque**:
+   - Si la aplicación no inicia correctamente, revisa los logs para más detalles
+   - Railway puede terminar el proceso si tarda demasiado en iniciar
+
+3. **Configuración de rutas WebSocket en Railway**:
    - Asegúrate de que las rutas en railway.toml son correctas
-
-3. **Firewall o restricciones de red**:
-   - Railway puede tener restricciones adicionales de red
 
 ## Recursos útiles
 
+- [Documentación sobre healthchecks en Railway](https://docs.railway.app/deploy/deployments#healthchecks)
 - [Buenas prácticas para WebSockets en contenedores](https://devcenter.heroku.com/articles/websockets#websockets-with-node-js)
-- [FAQ sobre redes en Railway](https://docs.railway.app/faq)
-- [Problemas comunes en Railway](https://docs.railway.app/troubleshoot/railway-up) 
+- [FAQ sobre redes en Railway](https://docs.railway.app/faq) 
