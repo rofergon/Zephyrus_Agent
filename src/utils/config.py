@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # API URLs
-DB_API_URL = os.getenv('DB_API_URL', 'https://069c626bcc34.ngrok.app/api/db')
+DB_API_URL = os.getenv('DB_API_URL', 'https://3ea5d3427422.ngrok.app/api/db')
 BLOCKCHAIN_API_URL = os.getenv('BLOCKCHAIN_API_URL', '')
 
 # Configuración del WebSocket

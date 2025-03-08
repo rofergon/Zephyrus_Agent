@@ -1,0 +1,3 @@
+@echo off
+echo Starting Agent Execution WebSocket Server...
+python src/main_execution_server.py 
