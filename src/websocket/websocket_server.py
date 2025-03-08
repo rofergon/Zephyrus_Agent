@@ -20,8 +20,18 @@ logger = setup_logger(__name__)
 
 class WebSocketServer:
     def __init__(self, agent_manager: AgentManager):
-        # Usar el WS_HOST de la configuración
-        self.host = WS_HOST
+        # RAILWAY FIX: Forzar 0.0.0.0 como host en Railway
+        # Detectar si estamos en Railway
+        is_railway = 'RAILWAY_STATIC_URL' in os.environ or 'RAILWAY_PUBLIC_DOMAIN' in os.environ or os.environ.get('RAILWAY_ENVIRONMENT') == 'production'
+        
+        if is_railway:
+            # Si estamos en Railway, forzar 0.0.0.0 como host
+            self.host = '0.0.0.0'
+            logger.info("Detectado entorno Railway, forzando host a 0.0.0.0")
+        else:
+            # Si no estamos en Railway, usar el valor de configuración
+            self.host = WS_HOST
+            logger.info(f"Usando host de configuración: {self.host}")
         
         # Obtener puerto directamente de la variable PORT de Railway si está disponible
         # o usar WS_PORT de la configuración como respaldo
@@ -32,6 +42,8 @@ class WebSocketServer:
         else:
             self.port = WS_PORT
             logger.info(f"Usando el puerto de configuración: {self.port}")
+            
+        logger.info(f"WebSocketServer inicializado con host={self.host} puerto={self.port}")
             
         self.agent_manager = agent_manager
         self.clients = {}  # {websocket: path}
@@ -959,7 +971,15 @@ class WebSocketServer:
         try:
             # Registrar información adicional para depuración
             logger.info(f"Iniciando servidor WebSocket en host={self.host} puerto={self.port}")
-            logger.info(f"Variables de entorno: PORT={os.environ.get('PORT')}, WS_PORT={os.environ.get('WS_PORT')}")
+            logger.info(f"Variables de entorno: PORT={os.environ.get('PORT')}, WS_PORT={os.environ.get('WS_PORT')}, WS_HOST={os.environ.get('WS_HOST')}")
+            
+            # RAILWAY FIX: Último chequeo para asegurar que estamos usando 0.0.0.0 si estamos en Railway
+            if 'RAILWAY_STATIC_URL' in os.environ or 'RAILWAY_PUBLIC_DOMAIN' in os.environ:
+                if self.host != '0.0.0.0':
+                    logger.warning(f"¡CORRECCIÓN! Detectado Railway pero host es {self.host}. Forzando a 0.0.0.0")
+                    self.host = '0.0.0.0'
+            
+            logger.info(f"INICIANDO EN: ws://{self.host}:{self.port} - Asegúrate de que esto sea 0.0.0.0 en Railway")
             
             self.server = await websockets.serve(
                 self.ws_handler,

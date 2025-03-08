@@ -228,11 +228,23 @@ async def start_server():
     try:
         # Obtener el puerto directamente de la variable PORT de Railway si está disponible
         port = int(os.environ.get('PORT', WS_PORT))
-        host = os.environ.get('WS_HOST', WS_HOST)
+        
+        # RAILWAY FIX: Forzar 0.0.0.0 como host en Railway
+        # Detectar si estamos en Railway
+        is_railway = 'RAILWAY_STATIC_URL' in os.environ or 'RAILWAY_PUBLIC_DOMAIN' in os.environ or os.environ.get('RAILWAY_ENVIRONMENT') == 'production'
+        
+        if is_railway:
+            # Si estamos en Railway, forzar 0.0.0.0 como host
+            host = '0.0.0.0'
+            logger.info("Detectado entorno Railway, forzando host a 0.0.0.0")
+        else:
+            # Si no estamos en Railway, usar el valor de configuración o el entorno
+            host = os.environ.get('WS_HOST', WS_HOST)
         
         # Registrar información para depuración
         logger.info(f"Iniciando servidor WebSocket en host={host} puerto={port}")
-        logger.info(f"Variables de entorno: PORT={os.environ.get('PORT')}, WS_PORT={os.environ.get('WS_PORT')}")
+        logger.info(f"Variables de entorno: PORT={os.environ.get('PORT')}, WS_PORT={os.environ.get('WS_PORT')}, WS_HOST={os.environ.get('WS_HOST')}")
+        logger.info(f"INICIANDO EN: ws://{host}:{port} - Asegúrate de que esto sea 0.0.0.0 en Railway")
         
         server = await websockets.serve(
             handle_websocket_connection, 
