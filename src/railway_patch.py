@@ -9,6 +9,7 @@ import sys
 import asyncio
 import threading
 import logging
+import json
 from aiohttp import web
 
 # Forzar las variables críticas antes de importar el resto
@@ -25,6 +26,31 @@ print(f"[RAILWAY PATCH] Forzando WS_HOST=0.0.0.0 y WS_PORT={os.environ.get('PORT
 # Función para el healthcheck HTTP
 async def handle_healthcheck(request):
     return web.Response(text="OK", status=200)
+
+# Clase adaptadora para hacer compatible WebSocketResponse de aiohttp con websockets
+class WebSocketAdapter:
+    def __init__(self, ws_response):
+        self._ws = ws_response
+        
+    async def send(self, data):
+        """
+        Adapta el método send() de websockets a send_str() de aiohttp
+        """
+        if isinstance(data, str):
+            return await self._ws.send_str(data)
+        elif isinstance(data, dict):
+            return await self._ws.send_json(data)
+        elif isinstance(data, bytes):
+            return await self._ws.send_bytes(data)
+        else:
+            # Si es otro tipo, intentamos convertirlo a string
+            return await self._ws.send_str(str(data))
+            
+    # Implementar otros métodos que pueda necesitar
+    async def close(self, code=1000, reason=""):
+        return await self._ws.close(code=code, message=reason)
+        
+    # Añadir cualquier otro método necesario para la compatibilidad
 
 # Integramos ambos servidores en la misma aplicación
 async def start_integrated_server():
@@ -61,17 +87,26 @@ async def start_integrated_server():
         ws = web.WebSocketResponse()
         await ws.prepare(request)
         
-        # Registrar el websocket
-        await ws_server.register(ws)
+        # Creamos un adaptador para hacer compatible la interfaz
+        adapter = WebSocketAdapter(ws)
+        
+        # Registrar el websocket usando el adaptador
+        await ws_server.register(adapter)
+        
+        # Extraer el agent_id de la URL
+        agent_id = request.match_info.get('agent_id', 'unknown')
+        print(f"WebSocket connection established for agent: {agent_id}")
         
         try:
             async for msg in ws:
                 if msg.type == web.WSMsgType.TEXT:
-                    await ws_server.handle_message(ws, msg.data)
+                    # Usar el adaptador para manejar mensajes
+                    await ws_server.handle_message(adapter, msg.data)
                 elif msg.type == web.WSMsgType.ERROR:
                     print(f'WebSocket connection closed with exception {ws.exception()}')
         finally:
-            await ws_server.unregister(ws)
+            # Usamos el adaptador para desregistrar
+            await ws_server.unregister(adapter)
             
         return ws
     
