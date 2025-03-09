@@ -3,7 +3,7 @@ import json
 import asyncio
 from datetime import datetime
 import logging
-from openai import AsyncOpenAI
+from openai import OpenAI
 from pydantic import BaseModel
 from src.utils.logger import setup_logger
 from src.api.db_client import DatabaseClient
@@ -124,10 +124,19 @@ class AutonomousAgent:
                     instance.schedule = await db_client.get_agent_schedule(instance.agent_id)
 
                 # Inicializar el cliente de OpenAI
-                instance.openai_client = AsyncOpenAI()
+                try:
+                    api_key = os.environ.get("OPENAI_API_KEY")
+                    if not api_key:
+                        logger.warning("No OPENAI_API_KEY found in environment variables")
+                    else:
+                        instance.openai_client = OpenAI(api_key=api_key)
+                        logger.info("OpenAI client initialized successfully")
+                except Exception as e:
+                    logger.error(f"Error initializing OpenAI client: {str(e)}")
                 
+                # Retornar la instancia configurada
                 return instance
-                
+
             except Exception as e:
                 logger.error(f"Error en from_config: {str(e)}")
                 raise ValueError(f"Error configurando el agente: {str(e)}")
@@ -150,15 +159,12 @@ class AutonomousAgent:
                 
                 # Inicializar el cliente de OpenAI
                 try:
-                    from openai import OpenAI
                     api_key = os.environ.get("OPENAI_API_KEY")
                     if not api_key:
                         logger.warning("No OPENAI_API_KEY found in environment variables")
                     else:
                         self.openai_client = OpenAI(api_key=api_key)
                         logger.info("OpenAI client initialized successfully")
-                except ImportError:
-                    logger.error("OpenAI package not installed. Please install with: pip install openai")
                 except Exception as e:
                     logger.error(f"Error initializing OpenAI client: {str(e)}")
                 
@@ -455,6 +461,9 @@ class AutonomousAgent:
             # Verificar si debemos asegurar completar todas las tareas
             complete_all_tasks = trigger_data.get('complete_all_tasks', False)
             
+            # Obtener parámetros extraídos si existen
+            extracted_params = trigger_data.get('extracted_params', {})
+            
             # Analizar el estado y determinar acciones iniciales
             actions = await self.analyze_state(state, trigger_data)
             
@@ -484,6 +493,27 @@ class AutonomousAgent:
                         function_name = action.get('function')
                         params = action.get('params', {})
                         message = action.get('message')  # Extraer mensaje del modelo para esta acción
+                        
+                        # Si no hay parámetros definidos y tenemos parámetros extraídos, intentar usarlos
+                        if not params and extracted_params:
+                            # Buscar la función en las funciones disponibles
+                            matching_function = None
+                            for func in self.functions:
+                                if func.function_name == function_name:
+                                    matching_function = func
+                                    break
+                            
+                            if matching_function:
+                                # Intentar determinar parámetros basados en el tipo de función y los parámetros extraídos
+                                if matching_function.function_type == "read" and function_name.lower() in ["balanceof", "balance"]:
+                                    if extracted_params.get("addresses"):
+                                        params = {"account": extracted_params["addresses"][0]}
+                                
+                                elif matching_function.function_type == "write" and function_name.lower() in ["mint", "transfer"]:
+                                    if extracted_params.get("addresses"):
+                                        params = {"to": extracted_params["addresses"][0]}
+                                        if extracted_params.get("amounts"):
+                                            params["amount"] = extracted_params["amounts"][0]
                         
                         # Buscar la función en las funciones configuradas del agente
                         matching_function = None
@@ -541,241 +571,594 @@ class AutonomousAgent:
         except Exception as e:
             logger.error(f"Error in analyze_and_execute for agent {self.agent_id}: {str(e)}")
             raise
-            
-    async def analyze_results(self, state: Dict, trigger_data: Dict, execution_history: List[Dict]) -> List[Dict]:
+
+    async def analyze_state(self, state: Dict, trigger_data: Dict) -> List[Dict]:
         """
-        Analiza los resultados de las ejecuciones previas para determinar acciones adicionales
+        Analiza el estado actual y determina qué funciones ejecutar
         
         Args:
             state: Estado actual del contrato
             trigger_data: Datos del disparador de ejecución
-            execution_history: Historial de ejecuciones previas
+            
+        Returns:
+            Lista de acciones a ejecutar
+        """
+        try:
+            # Obtener parámetros extraídos si existen
+            extracted_params = trigger_data.get('extracted_params', {})
+            
+            # Inicializar acciones a ejecutar
+            actions = []
+            
+            # Si hay parámetros extraídos, podemos usarlos para determinar acciones iniciales
+            if extracted_params:
+                logger.info(f"Analyzing extracted parameters: {extracted_params}")
+                behaviors = extracted_params.get("behaviors", [])
+                addresses = extracted_params.get("addresses", [])
+                amounts = extracted_params.get("amounts", [])
+                conditions = extracted_params.get("conditions", [])
+                
+                # Determinar umbrales y cantidades de minteo
+                threshold_amount = None
+                mint_amount = None
+                
+                # Intentar obtener cantidades de los parámetros extraídos
+                if amounts:
+                    if len(amounts) >= 1:
+                        # La primera cantidad suele ser el umbral
+                        threshold_amount = amounts[0]
+                    if len(amounts) >= 2:
+                        # La segunda cantidad suele ser la cantidad a mintear
+                        mint_amount = amounts[1]
+                
+                # Si no tenemos cantidades pero tenemos condiciones, intentar extraerlas
+                if threshold_amount is None and conditions:
+                    for condition in conditions:
+                        # Buscar patrones como "less than X"
+                        match = re.search(r'less than\s+(\d+)', condition)
+                        if match:
+                            threshold_amount = int(match.group(1))
+                            logger.info(f"Extracted threshold from condition: {threshold_amount}")
+                            break
+                
+                # Buscar en la descripción para la cantidad a mintear si no la tenemos
+                if mint_amount is None:
+                    description = self.agent.description.lower()
+                    # Buscar patrones como "mint X at a time"
+                    match = re.search(r'mint\s+(\d+)', description)
+                    if match:
+                        mint_amount = int(match.group(1))
+                        logger.info(f"Extracted mint amount from description: {mint_amount}")
+                
+                # Valores por defecto si no se han encontrado
+                if threshold_amount is None:
+                    if "less than" in str(conditions).lower():
+                        # Usar 5 como valor por defecto razonable
+                        threshold_amount = 5
+                        logger.info(f"Using default threshold amount: {threshold_amount}")
+                
+                if mint_amount is None and threshold_amount is not None:
+                    # Usar 1 como valor por defecto o el umbral dividido por 2
+                    mint_amount = max(1, threshold_amount // 2)
+                    logger.info(f"Using default mint amount: {mint_amount}")
+                
+                # Actualizar los parámetros extraídos con los nuevos valores
+                if threshold_amount is not None and threshold_amount not in amounts:
+                    amounts.append(threshold_amount)
+                if mint_amount is not None and mint_amount not in amounts:
+                    amounts.append(mint_amount)
+                
+                # Actualizar los parámetros extraídos en trigger_data
+                extracted_params["amounts"] = amounts
+                trigger_data["extracted_params"] = extracted_params
+                
+                # Si se espera verificar un balance, empezar con esa acción
+                if any(behavior in behaviors for behavior in ["check_balance", "check", "balance"]):
+                    # Buscar función de balance
+                    balance_function = None
+                    for func in self.functions:
+                        if func.function_name.lower() in ["balanceof", "balance"]:
+                            balance_function = func
+                            break
+                    
+                    if balance_function:
+                        # Crear parámetros para la función
+                        params = {}
+                        if addresses:
+                            # Para balanceOf, normalmente el parámetro se llama "account"
+                            param_name = "account"
+                            # Intentar obtener el nombre del parámetro del ABI
+                            if balance_function.abi and "inputs" in balance_function.abi:
+                                for input_param in balance_function.abi["inputs"]:
+                                    if input_param.get("type") == "address":
+                                        param_name = input_param.get("name", "account")
+                                        break
+                            
+                            params[param_name] = addresses[0]
+                            
+                            # Añadir acción de verificación de balance
+                            actions.append({
+                                "function": balance_function.function_name,
+                                "params": params,
+                                "message": f"Checking balance for address {addresses[0]}"
+                            })
+                            
+                            logger.info(f"Added balance check action for address {addresses[0]}")
+                
+                # Si no hay acciones específicas pero se menciona "mint" en los comportamientos,
+                # y tenemos una operación de mint disponible, programarla directamente
+                if not actions and "mint" in behaviors:
+                    mint_function = None
+                    for func in self.functions:
+                        if func.function_name.lower() == "mint" and func.function_type == "write":
+                            mint_function = func
+                            break
+                    
+                    if mint_function and addresses:
+                        # Determinar la cantidad a mintear
+                        mint_amount = mint_amount if mint_amount is not None else 5000000
+                        
+                        # Crear parámetros para la función mint
+                        to_param_name = "to"
+                        amount_param_name = "amount"
+                        
+                        if mint_function.abi and "inputs" in mint_function.abi:
+                            for input_param in mint_function.abi["inputs"]:
+                                if input_param.get("type") == "address":
+                                    to_param_name = input_param.get("name", "to")
+                                elif input_param.get("type") in ["uint256", "uint"]:
+                                    amount_param_name = input_param.get("name", "amount")
+                        
+                        params = {
+                            to_param_name: addresses[0],
+                            amount_param_name: mint_amount
+                        }
+                        
+                        actions.append({
+                            "function": mint_function.function_name,
+                            "params": params,
+                            "message": f"Minting {mint_amount} tokens to {addresses[0]}"
+                        })
+                        
+                        logger.info(f"Added mint action for {mint_amount} tokens to {addresses[0]}")
+                
+                # Si no hay acciones específicas, usar el algoritmo normal
+                if not actions:
+                    logger.info("No specific actions determined from extracted parameters, using fallback algorithm")
+                    actions = await self._determine_initial_actions_from_description()
+            
+            # Si no hay acciones determinadas, usar OpenAI para analizar
+            if not actions:
+                # Construir la lista de funciones con información detallada
+                functions_info = []
+                for f in self.functions:
+                    if f.is_enabled:
+                        function_info = {
+                            'name': f.function_name,
+                            'type': f.function_type,
+                            'signature': f.function_signature,
+                            'enabled': f.is_enabled,
+                            'abi': f.abi
+                        }
+                        
+                        # Añadir detalles sobre los parámetros requeridos
+                        if f.abi and 'inputs' in f.abi:
+                            function_info['required_params'] = [
+                                {
+                                    'name': input_param.get('name'),
+                                    'type': input_param.get('type'),
+                                    'description': f"Parameter of type {input_param.get('type')}"
+                                }
+                                for input_param in f.abi['inputs']
+                                if 'name' in input_param
+                            ]
+                        
+                        functions_info.append(function_info)
+                
+                prompt = f"""
+                Current contract state:
+                {json.dumps(state, indent=2)}
+                
+                Trigger event data:
+                {json.dumps(trigger_data, indent=2)}
+                
+                Agent description (behavior):
+                {self.agent.description}
+                
+                Contract current state:
+                {json.dumps(self.agent.contract_state, indent=2)}
+                
+                Available functions:
+                {json.dumps(functions_info, indent=2)}
+                
+                Based on the current state, the agent's behavior description, and available functions,
+                what actions should be taken? Consider the validation rules and function types.
+                Return the actions as function calls with appropriate parameters.
+                
+                You MUST include a 'message' field with each function call to provide comments or explanations about the execution.
+                These messages will be stored in the execution logs and shown to users, serving as your communication channel.
+                """
+                
+                try:
+                    response = self.openai_client.chat.completions.create(
+                        model="gpt-4",
+                        messages=[
+                            {"role": "system", "content": "You are an autonomous agent managing a smart contract. You generate appropriate parameter values for function calls based on context and function specifications."},
+                            {"role": "user", "content": prompt}
+                        ],
+                        tools=[{
+                            "type": "function",
+                            "function": {
+                                "name": "execute_functions",
+                                "description": "Execute functions on the smart contract",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "functions": {
+                                            "type": "array",
+                                            "items": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "function_name": {"type": "string", "description": "Name of the function to execute"},
+                                                    "parameters": {"type": "object", "description": "Parameters for the function"},
+                                                    "message": {"type": "string", "description": "Optional message or comment to include in the execution log"}
+                                                },
+                                                "required": ["function_name", "parameters", "message"]
+                                            }
+                                        }
+                                    },
+                                    "required": ["functions"]
+                                }
+                            }
+                        }],
+                        tool_choice="auto"
+                    )
+                    
+                    actions = self._parse_openai_response(response)
+                    
+                except Exception as e:
+                    logger.error(f"Error calling OpenAI for analyze_state: {str(e)}")
+                    
+                    # Si hay un error con OpenAI, intentar determinar acciones basadas en los parámetros extraídos
+                    if extracted_params:
+                        logger.info(f"Fallback: Determinando acciones basadas en parámetros extraídos: {extracted_params}")
+                        actions = await self._determine_initial_actions_from_description()
+                        
+                        # Si no se pudieron determinar acciones, intentar crear acciones basadas en comportamientos
+                        if not actions and "behaviors" in extracted_params:
+                            behaviors = extracted_params["behaviors"]
+                            addresses = extracted_params.get("addresses", [])
+                            amounts = extracted_params.get("amounts", [])
+                            
+                            # Si se requiere verificar balances
+                            if "check_balance" in behaviors or "check" in behaviors:
+                                for func_name, func in self._functions.items():
+                                    if func.name.lower() == "balanceof" and addresses:
+                                        actions.append({
+                                            "function_name": func.name,
+                                            "parameters": {"account": addresses[0]},
+                                            "message": f"Checking balance for address {addresses[0]}"
+                                        })
+                                        break
+                            
+                            # Si se requiere mintear tokens
+                            if "mint" in behaviors and not actions:
+                                for func_name, func in self._functions.items():
+                                    if func.name.lower() == "mint" and addresses:
+                                        amount = amounts[1] if len(amounts) > 1 else (amounts[0] if amounts else 5000000)
+                                        actions.append({
+                                            "function_name": func.name,
+                                            "parameters": {"to": addresses[0], "amount": amount},
+                                            "message": f"Minting {amount} tokens to {addresses[0]}"
+                                        })
+                                        break
+            
+            logger.info(f"Determined {len(actions)} initial actions for agent {self.agent_id}")
+            return actions
+            
+        except Exception as e:
+            logger.error(f"Error in analyze_state for agent {self.agent_id}: {str(e)}")
+            return []
+
+    async def _determine_initial_actions_from_description(self) -> List[Dict]:
+        """
+        Determina acciones iniciales basadas en la descripción del agente
+        y las funciones disponibles
         
         Returns:
-            Lista de acciones adicionales a ejecutar
+            Lista de acciones iniciales
         """
-        # Construir la lista de funciones con información detallada
-        functions_info = []
-        for f in self.functions:
-            if f.is_enabled:
-                function_info = {
-                    'name': f.function_name,
-                    'type': f.function_type,
-                    'signature': f.function_signature,
-                    'enabled': f.is_enabled,
-                    'abi': f.abi
-                }
-                
-                # Añadir detalles sobre los parámetros requeridos
-                if f.abi and 'inputs' in f.abi:
-                    function_info['required_params'] = [
-                        {
-                            'name': input_param.get('name'),
-                            'type': input_param.get('type'),
-                            'description': f"Parameter of type {input_param.get('type')}"
-                        }
-                        for input_param in f.abi['inputs']
-                        if 'name' in input_param
-                    ]
-                
-                functions_info.append(function_info)
+        actions = []
+        description = self.agent.description.lower() if self.agent and self.agent.description else ""
         
-        # Verificar si debemos completar todas las tareas según la descripción del agente
-        complete_all_tasks = trigger_data.get('complete_all_tasks', False)
-        
-        # Extraer las funciones ya ejecutadas
-        executed_functions = [history_item.get('function') for history_item in execution_history]
-        
-        # Extraer los resultados específicos de lecturas y acciones importantes
-        domain_separator_result = None
-        admin_role_result = None
-        
-        # Crear tracking de direcciones que ya recibieron minteo
-        minted_addresses = set()
-        
-        for r in execution_history:
-            if r.get('function') == "DOMAIN_SEPARATOR" and 'result' in r and isinstance(r['result'], dict) and 'data' in r['result']:
-                domain_separator_result = r['result']['data']
-            elif r.get('function') == "ADMIN_ROLE" and 'result' in r and isinstance(r['result'], dict) and 'data' in r['result']:
-                admin_role_result = r['result']['data']
-            elif r.get('function') == "mint" and 'params' in r and 'to' in r['params']:
-                minted_addresses.add(r['params']['to'])
-        
-        # Extraer las direcciones esperadas de la descripción
-        description = self.agent.description.lower()
-        expected_addresses = []
-        
-        # Buscar direcciones Ethereum en la descripción
+        # Extraer direcciones y cantidades de la descripción
         address_pattern = r'0x[a-fA-F0-9]{40}'
-        addresses_in_description = re.findall(address_pattern, self.agent.description)
-        if addresses_in_description:
-            expected_addresses = addresses_in_description
+        addresses = re.findall(address_pattern, description)
         
-        # Definir tareas pendientes basadas en la descripción y lo ya ejecutado
-        pending_tasks = []
+        # Nueva expresión regular que captura cualquier número, incluidos pequeños
+        amount_pattern = r'(?:less than|mint|equals|equal to|greater than|more than|minimum|maximum|min|max|about|around|approximately|exactly|precisely)\s+(\d+)'
+        threshold_amounts = [int(amount) for amount in re.findall(amount_pattern, description)]
         
-        # Si no se ha ejecutado DOMAIN_SEPARATOR y está en la descripción
-        if "domain_separator" in description.lower() and "DOMAIN_SEPARATOR" not in executed_functions:
-            pending_tasks.append({
-                "function": "DOMAIN_SEPARATOR",
-                "params": {},
-                "message": "Getting the domain separator data as described in the behavior."
-            })
+        # Otra expresión para capturar números sueltos, especialmente en el formato "mint X at a time"
+        direct_amount_pattern = r'\b(\d+)\s+(?:at a time|tokens|coin|coins|wei|gwei|eth|ether|token)\b'
+        direct_amounts = [int(amount) for amount in re.findall(direct_amount_pattern, description)]
         
-        # Si no se ha ejecutado ADMIN_ROLE y está en la descripción
-        if ("admin_role" in description.lower() or "admind role" in description.lower()) and "ADMIN_ROLE" not in executed_functions:
-            pending_tasks.append({
-                "function": "ADMIN_ROLE",
-                "params": {},
-                "message": "Reading the ADMIN_ROLE value as required in the agent description."
-            })
+        # También capturar números solos (pero evitando direcciones hexadecimales)
+        standalone_pattern = r'(?<![a-fA-F0-9])\b(\d+)\b(?![a-fA-F0-9])'
+        standalone_amounts = []
+        for amount in re.findall(standalone_pattern, description):
+            # Evitar duplicados
+            num = int(amount)
+            if num not in threshold_amounts and num not in direct_amounts:
+                standalone_amounts.append(num)
         
-        # Mintear tokens a direcciones mencionadas que aún no se han procesado
-        for addr in expected_addresses:
-            if addr not in minted_addresses and "mint" in description.lower():
-                # Busca un valor específico para mintear en la descripción cerca de esta dirección
-                amount_pattern = r'(\d+)(?:\s+tokenes|\s+tokens)'
-                amounts = re.findall(amount_pattern, description.lower())
-                amount = 5000000  # Valor por defecto
+        # Combinar todas las cantidades, dando prioridad a las que tienen contexto
+        amounts = threshold_amounts + direct_amounts + standalone_amounts
+        
+        logger.info(f"Extracted from description - Addresses: {addresses}, Amounts: {amounts}")
+        
+        # Buscar acciones basadas en patrones comunes en la descripción
+        
+        # Verificar si hay funciones de lectura de balance
+        if "balance" in description or "check" in description:
+            for func in self.functions:
+                if func.function_name.lower() in ["balanceof", "balance"] and func.function_type == "read":
+                    params = {}
+                    if addresses:
+                        # Buscar el nombre del parámetro en el ABI
+                        param_name = "account"
+                        if func.abi and "inputs" in func.abi:
+                            for input_param in func.abi["inputs"]:
+                                if input_param.get("type") == "address":
+                                    param_name = input_param.get("name", "account")
+                                    break
+                        
+                        params[param_name] = addresses[0]
+                    
+                    actions.append({
+                        "function": func.function_name,
+                        "params": params,
+                        "message": f"Checking balance for address {addresses[0] if addresses else 'owner'}"
+                    })
+                    break
+        
+        # Verificar si hay funciones de mint o transfer
+        if "mint" in description or "transfer" in description or "send" in description:
+            # Si ya hay funciones de lectura, no añadir funciones de escritura en la primera pasada
+            if not actions:
+                for func in self.functions:
+                    if func.function_name.lower() in ["mint", "transfer", "send"] and func.function_type == "write":
+                        params = {}
+                        if addresses:
+                            # Buscar el nombre del parámetro en el ABI
+                            to_param_name = "to"
+                            amount_param_name = "amount"
+                            
+                            if func.abi and "inputs" in func.abi:
+                                for input_param in func.abi["inputs"]:
+                                    if input_param.get("type") == "address":
+                                        to_param_name = input_param.get("name", "to")
+                                    elif input_param.get("type") in ["uint256", "uint"]:
+                                        amount_param_name = input_param.get("name", "amount")
+                            
+                            params[to_param_name] = addresses[0]
+                            if amounts:
+                                params[amount_param_name] = amounts[0]
+                            elif "amount" not in params:
+                                # Valor por defecto si no se especifica
+                                params[amount_param_name] = 5000000
+                        
+                        actions.append({
+                            "function": func.function_name,
+                            "params": params,
+                            "message": f"Minting tokens to {addresses[0] if addresses else 'address'}"
+                        })
+                        break
+        
+        return actions
+
+    async def analyze_results(self, state: Dict, trigger_data: Dict, execution_history: List[Dict]) -> List[Dict]:
+        """
+        Analiza los resultados de la ejecución anterior y determina las siguientes acciones
+        
+        Args:
+            state: Estado actual del contrato
+            trigger_data: Datos del disparador
+            execution_history: Historial de ejecuciones previas
+            
+        Returns:
+            Lista de acciones a ejecutar
+        """
+        # Obtener parámetros extraídos si existen
+        extracted_params = trigger_data.get('extracted_params', {})
+        
+        # Si hay tareas pendientes de ejecuciones previas, devolverlas
+        pending_tasks = self._get_pending_tasks(execution_history)
+        
+        # Analizar explícitamente el historial de ejecución para detectar si necesitamos continuar 
+        # basándonos en la descripción del agente y las condiciones extraídas
+        if execution_history and extracted_params:
+            # Extraer información relevante de los parámetros
+            addresses = extracted_params.get("addresses", [])
+            amounts = extracted_params.get("amounts", [])
+            behaviors = extracted_params.get("behaviors", [])
+            
+            # Verificar si la descripción implica verificar balance y mintear si es necesario
+            if "check_balance" in behaviors or "check" in behaviors:
+                # Buscar la última ejecución de balanceOf
+                last_balance_check = None
+                for execution in reversed(execution_history):
+                    if execution.get("function") and execution.get("function").lower() in ["balanceof", "balance"]:
+                        last_balance_check = execution
+                        break
                 
-                if amounts:
-                    try:
-                        amount = int(amounts[0])
-                    except ValueError:
-                        pass
-                
-                pending_tasks.append({
-                    "function": "mint",
-                    "params": {
-                        "to": addr,
-                        "amount": amount
-                    },
-                    "message": f"Minting {amount} tokens to {addr} as specified in the agent description."
-                })
+                # Si se verificó el balance y tenemos información sobre las condiciones
+                if last_balance_check and "result" in last_balance_check and last_balance_check["result"].get("success"):
+                    # Obtener el valor del balance
+                    balance_result = last_balance_check["result"].get("data")
+                    if balance_result:
+                        try:
+                            current_balance = int(balance_result)
+                            logger.info(f"Detected current balance: {current_balance}")
+                            
+                            # Verificar condición de balance mínimo
+                            # Si no hay cantidades extraídas pero hay una condición de "menos que", intentar extraerla
+                            conditions = extracted_params.get("conditions", [])
+                            threshold_amount = None
+                            mint_amount = None
+                            
+                            # Intentar obtener cantidades de los parámetros extraídos
+                            if amounts:
+                                if len(amounts) >= 1:
+                                    # La primera cantidad suele ser el umbral
+                                    threshold_amount = amounts[0]
+                                if len(amounts) >= 2:
+                                    # La segunda cantidad suele ser la cantidad a mintear
+                                    mint_amount = amounts[1]
+                            
+                            # Si no tenemos cantidades pero tenemos condiciones, intentar extraerlas
+                            if threshold_amount is None and conditions:
+                                for condition in conditions:
+                                    # Buscar patrones como "less than X"
+                                    match = re.search(r'less than\s+(\d+)', condition)
+                                    if match:
+                                        threshold_amount = int(match.group(1))
+                                        logger.info(f"Extracted threshold from condition: {threshold_amount}")
+                                        break
+                            
+                            # Buscar en la descripción para la cantidad a mintear si no la tenemos
+                            if mint_amount is None:
+                                description = self.agent.description.lower()
+                                # Buscar patrones como "mint X at a time"
+                                match = re.search(r'mint\s+(\d+)', description)
+                                if match:
+                                    mint_amount = int(match.group(1))
+                                    logger.info(f"Extracted mint amount from description: {mint_amount}")
+                            
+                            # Valores por defecto si no se han encontrado
+                            if threshold_amount is None:
+                                # Usar 5 como valor por defecto razonable
+                                threshold_amount = 5
+                                logger.info(f"Using default threshold amount: {threshold_amount}")
+                            
+                            if mint_amount is None:
+                                # Usar 1 como valor por defecto o el umbral dividido por 2
+                                mint_amount = max(1, threshold_amount // 2)
+                                logger.info(f"Using default mint amount: {mint_amount}")
+                            
+                            # Comparar el balance actual con el umbral
+                            logger.info(f"Comparing balance {current_balance} with threshold {threshold_amount}")
+                            if current_balance < threshold_amount and "mint" in behaviors:
+                                logger.info(f"Balance {current_balance} is below threshold {threshold_amount}, need to mint tokens")
+                                
+                                # Buscar función de mint
+                                for func in self.functions:
+                                    if func.function_name.lower() == "mint" and func.function_type == "write":
+                                        # Crear la acción de mint
+                                        mint_action = {
+                                            "function": func.function_name,
+                                            "params": {
+                                                "to": addresses[0] if addresses else self.agent.owner,
+                                                "amount": mint_amount
+                                            },
+                                            "message": f"Minting {mint_amount} tokens to {addresses[0] if addresses else 'owner'} to meet threshold of {threshold_amount}"
+                                        }
+                                        return [mint_action]
+                            
+                            # Si el balance es menor que el umbral pero ya hemos ejecutado mint recientemente,
+                            # programar otra verificación de balance
+                            elif current_balance < threshold_amount:
+                                # Verificar si la última acción fue un mint
+                                last_action = execution_history[-1]
+                                if last_action.get("function") and last_action.get("function").lower() == "mint":
+                                    # Programar otra verificación de balance para ver si el mint fue efectivo
+                                    for func in self.functions:
+                                        if func.function_name.lower() in ["balanceof", "balance"] and func.function_type == "read":
+                                            check_action = {
+                                                "function": func.function_name,
+                                                "params": {
+                                                    "account": addresses[0] if addresses else self.agent.owner
+                                                },
+                                                "message": f"Checking updated balance after mint for {addresses[0] if addresses else 'owner'}"
+                                            }
+                                            return [check_action]
+                        except (ValueError, TypeError) as e:
+                            logger.error(f"Error parsing balance result '{balance_result}': {str(e)}")
         
-        # Solo devolver tareas pendientes si estamos en modo de completar todas las tareas o es el primer ciclo
-        if complete_all_tasks and pending_tasks:
+        # Si no necesitamos consultar a OpenAI y tenemos tareas pendientes, devolver las tareas pendientes
+        if not trigger_data.get("complete_all_tasks", False) and pending_tasks:
             return pending_tasks
         
-        # Si ya no hay tareas pendientes o no estamos en modo completar todas, ejecutar la lógica normal
-        prompt = f"""
-        Current contract state:
-        {json.dumps(state, indent=2)}
+        # Resto del código original para consultar a OpenAI
+        # Construir el prompt para el modelo
+        messages = [
+            {
+                "role": "system",
+                "content": f"""Eres un asistente que analiza el estado de un contrato inteligente y determina qué acciones tomar.
+                
+Contrato: {self.agent.contract_id if self.agent else 'Desconocido'}
+Nombre: {self.agent.name if self.agent else 'Desconocido'}
+Descripción: {self.agent.description if self.agent else 'Desconocido'}
+
+Estado actual: {json.dumps(state, indent=2)}
+
+Historial de ejecución:
+{json.dumps(execution_history, indent=2)}
+
+Tu tarea es revisar el estado, el historial de ejecución y determinar qué funciones se deben ejecutar a continuación.
+"""
+            }
+        ]
         
-        Trigger event data:
-        {json.dumps(trigger_data, indent=2)}
+        # Agregar información sobre las funciones disponibles
+        function_descriptions = ""
+        for func in self.functions:
+            function_descriptions += f"- {func.function_name} ({func.function_type}): {func.function_signature}\n"
         
-        Agent description (behavior):
-        {self.agent.description}
+        messages.append({
+            "role": "user",
+            "content": f"""Basándote en la descripción del agente y el historial de ejecución, determina qué acciones se deben tomar a continuación.
+            
+Funciones disponibles:
+{function_descriptions}
+
+Determina si se necesitan ejecutar más funciones o si todas las tareas se han completado.
+"""
+        })
         
-        Contract current state:
-        {json.dumps(self.agent.contract_state, indent=2)}
-        
-        Available functions:
-        {json.dumps(functions_info, indent=2)}
-        
-        Previous execution results:
-        {json.dumps(execution_history, indent=2)}
-        
-        Functions already executed:
-        {json.dumps(executed_functions, indent=2)}
-        
-        Based on the previous execution results, the current state, and the agent's behavior description,
-        determine if additional actions are needed.
-        
-        {'IMPORTANT: You MUST complete ALL tasks specified in the agent description. The agent description mentions specific tasks that should be executed.' if complete_all_tasks else ''}
-        
-        If the previous results indicate that further actions are required according to the agent's description,
-        return those actions as function calls with appropriate parameters.
-        
-        If the agent's description mentions:
-        1. Reading DOMAIN_SEPARATOR, ensure this function has been executed
-        2. Reading ADMIN_ROLE, ensure this function has been executed
-        3. Creating a log with both results, ensure this has been done
-        4. Minting tokens for specific addresses, ensure these operations have been executed
-        
-        {'Carefully check the functions already executed and compare them to what is required in the agent description. Make sure ALL required tasks are completed.' if complete_all_tasks else ''}
-        
-        Based on the execution history, here is the current status of required tasks:
-        - DOMAIN_SEPARATOR read: {'Yes' if domain_separator_result else 'No'}
-        - ADMIN_ROLE read: {'Yes' if admin_role_result else 'No'}
-        - Minted addresses so far: {list(minted_addresses)}
-        - Expected addresses in description: {expected_addresses}
-        - Addresses not yet minted: {[addr for addr in expected_addresses if addr not in minted_addresses]}
-        
-        Analyze the execution history and return ONLY the remaining actions needed to complete ALL tasks 
-        mentioned in the agent description. Be thorough and make sure you don't miss any required tasks.
-        
-        If no further actions are needed, respond with an empty array.
-        
-        You MUST include a 'message' field with each function call to provide comments or explanations about the execution.
-        These messages will be stored in the execution logs and shown to users, serving as your communication channel.
-        
-        IMPORTANT INSTRUCTIONS FOR GENERATING PARAMETERS:
-        1. Always use the function_call feature to respond. DO NOT respond with text.
-        2. Always include a meaningful message explaining what you're doing and why.
-        3. YOU are FULLY RESPONSIBLE for generating ALL parameter values - there is NO fallback system.
-        4. Analyze each function's required parameters from its ABI and generate appropriate values for EVERY parameter.
-        5. Generate parameter values based on:
-           - The parameter's type (address, uint256, string, etc.)
-           - The agent's description which contains hints about what values to use
-           - The context of what the function is supposed to do
-           - Any specific instructions or ranges mentioned in the description
-        
-        6. For specific parameter types:
-           - For addresses: Use Ethereum addresses mentioned in the description, or the contract address if appropriate
-           - For uint/int values: Generate sensible numeric values based on the context
-           - For strings: Create appropriate text values that match the context
-           - For booleans: Determine true/false based on the agent's purpose
-        
-        7. If the agent description mentions random or varied values (like "random amount between X and Y"),
-           you should generate an appropriate random value within that range.
-           
-        8. Make sure all generated values are correctly formatted for their type:
-           - Addresses must start with 0x and be 42 characters long
-           - Numeric values should be appropriate integers (not too large or small)
-           - Strings should be meaningful and contextually appropriate
-        
-        9. The parameters object MUST include ALL required fields with their correct names as defined in the ABI.
-        
-        10. The agent has NO capability to extract or generate values on its own - YOU must provide ALL parameter values.
-        
-        Remember: You have full authority and responsibility to decide appropriate parameter values based on context.
-        """
+        # Construir la definición de herramientas para el formato de OpenAI
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": "determine_actions",
+                "description": "Determina las próximas acciones a ejecutar basándose en el estado y el historial",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "functions": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "function_name": {"type": "string", "description": "Name of the function to execute"},
+                                    "parameters": {"type": "object", "description": "Parameters for the function"},
+                                    "message": {"type": "string", "description": "Optional message or comment to include in the execution log"}
+                                },
+                                "required": ["function_name", "parameters", "message"]
+                            }
+                        }
+                    },
+                    "required": ["functions"]
+                }
+            }
+        }]
         
         # Enviar consulta al modelo de OpenAI solo si no tenemos tareas pendientes predefinidas
         try:
             response = self.openai_client.chat.completions.create(
-                model="gpt-4",
-                messages=[
-                    {"role": "system", "content": "You are an autonomous agent managing a smart contract. You generate appropriate parameter values for function calls based on context and function specifications."},
-                    {"role": "user", "content": prompt}
-                ],
-                tools=[{
-                    "type": "function",
-                    "function": {
-                        "name": "execute_functions",
-                        "description": "Execute functions on the smart contract",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "functions": {
-                                    "type": "array",
-                                    "items": {
-                                        "type": "object",
-                                        "properties": {
-                                            "function_name": {"type": "string", "description": "Name of the function to execute"},
-                                            "parameters": {"type": "object", "description": "Parameters for the function"},
-                                            "message": {"type": "string", "description": "Optional message or comment to include in the execution log"}
-                                        },
-                                        "required": ["function_name", "parameters", "message"]
-                                    }
-                                }
-                            },
-                            "required": ["functions"]
-                        }
-                    }
-                }]
+                model="gpt-4", 
+                messages=messages,
+                tools=tools
             )
             
             # Procesar la respuesta
@@ -1136,12 +1519,12 @@ class AutonomousAgent:
             
             # Hacer la llamada a la API
             response = self.openai_client.chat.completions.create(
-                model="gpt-3.5-turbo",
+                model="gpt-4o",
                 messages=[
                     {"role": "system", "content": system_message},
                     {"role": "user", "content": user_message}
                 ],
-                temperature=0.2, # Baja temperatura para respuestas más precisas
+                temperature=0.3, # Baja temperatura para respuestas más precisas
                 response_format={"type": "json_object"}
             )
             
@@ -1367,97 +1750,87 @@ class AutonomousAgent:
                 
         except Exception as e:
             logger.error(f"Error determining functions to execute: {str(e)}")
-            return []
+            return [] 
 
-    async def analyze_state(self, state: Dict, trigger_data: Dict) -> List[Dict]:
+    def _get_pending_tasks(self, execution_history: List[Dict]) -> List[Dict]:
         """
-        Analiza el estado del contrato y determina acciones basadas en la descripción del agente
+        Determina si hay tareas pendientes basadas en el historial de ejecución
+        y la descripción del agente
         
         Args:
-            state: Estado actual del contrato
-            trigger_data: Datos del disparador de ejecución
+            execution_history: Historial de ejecuciones previas
             
         Returns:
-            Lista de acciones iniciales a ejecutar
+            Lista de tareas pendientes
         """
-        # Construir la lista de funciones con información detallada
-        functions_info = []
-        for f in self.functions:
-            if f.is_enabled:
-                function_info = {
-                    'name': f.function_name,
-                    'type': f.function_type,
-                    'signature': f.function_signature,
-                    'enabled': f.is_enabled,
-                    'abi': f.abi
-                }
+        # Extraer las funciones ya ejecutadas
+        executed_functions = [history_item.get('function') for history_item in execution_history]
+        
+        # Extraer los resultados específicos de lecturas y acciones importantes
+        domain_separator_result = None
+        admin_role_result = None
+        
+        # Crear tracking de direcciones que ya recibieron minteo
+        minted_addresses = set()
+        
+        for r in execution_history:
+            if r.get('function') == "DOMAIN_SEPARATOR" and 'result' in r and isinstance(r['result'], dict) and 'data' in r['result']:
+                domain_separator_result = r['result']['data']
+            elif r.get('function') == "ADMIN_ROLE" and 'result' in r and isinstance(r['result'], dict) and 'data' in r['result']:
+                admin_role_result = r['result']['data']
+            elif r.get('function') == "mint" and 'params' in r and 'to' in r['params']:
+                minted_addresses.add(r['params']['to'])
+        
+        # Extraer las direcciones esperadas de la descripción
+        description = self.agent.description.lower() if self.agent and hasattr(self.agent, 'description') else ""
+        expected_addresses = []
+        
+        # Buscar direcciones Ethereum en la descripción
+        address_pattern = r'0x[a-fA-F0-9]{40}'
+        addresses_in_description = re.findall(address_pattern, description)
+        if addresses_in_description:
+            expected_addresses = addresses_in_description
+        
+        # Definir tareas pendientes basadas en la descripción y lo ya ejecutado
+        pending_tasks = []
+        
+        # Si no se ha ejecutado DOMAIN_SEPARATOR y está en la descripción
+        if "domain_separator" in description and "DOMAIN_SEPARATOR" not in executed_functions:
+            pending_tasks.append({
+                "function_name": "DOMAIN_SEPARATOR",
+                "parameters": {},
+                "message": "Getting the domain separator data as described in the behavior."
+            })
+        
+        # Si no se ha ejecutado ADMIN_ROLE y está en la descripción
+        if ("admin_role" in description or "admin role" in description) and "ADMIN_ROLE" not in executed_functions:
+            pending_tasks.append({
+                "function_name": "ADMIN_ROLE",
+                "parameters": {},
+                "message": "Reading the ADMIN_ROLE value as required in the agent description."
+            })
+        
+        # Mintear tokens a direcciones mencionadas que aún no se han procesado
+        for addr in expected_addresses:
+            if addr not in minted_addresses and "mint" in description:
+                # Busca un valor específico para mintear en la descripción cerca de esta dirección
+                amount_pattern = r'(\d+)(?:\s+tokenes|\s+tokens)'
+                amounts = re.findall(amount_pattern, description)
+                amount = 5000000  # Valor por defecto
                 
-                # Añadir detalles sobre los parámetros requeridos
-                if f.abi and 'inputs' in f.abi:
-                    function_info['required_params'] = [
-                        {
-                            'name': input_param.get('name'),
-                            'type': input_param.get('type'),
-                            'description': f"Parameter of type {input_param.get('type')}"
-                        }
-                        for input_param in f.abi['inputs']
-                        if 'name' in input_param
-                    ]
+                if amounts:
+                    try:
+                        amount = int(amounts[0])
+                    except ValueError:
+                        pass
                 
-                functions_info.append(function_info)
-        
-        prompt = f"""
-        Current contract state:
-        {json.dumps(state, indent=2)}
-        
-        Trigger event data:
-        {json.dumps(trigger_data, indent=2)}
-        
-        Agent description (behavior):
-        {self.agent.description}
-        
-        Contract current state:
-        {json.dumps(self.agent.contract_state, indent=2)}
-        
-        Available functions:
-        {json.dumps(functions_info, indent=2)}
-        
-        Based on the current state, trigger event, and the agent's behavior description,
-        what actions should be taken? Consider the validation rules and function types.
-        Return the actions as function calls with appropriate parameters.
-        
-        You MUST include a 'message' field with each function call to provide comments or explanations about the execution.
-        These messages will be stored in the execution logs and shown to users, serving as your communication channel.
-        
-        IMPORTANT: 
-        1. Always use the function_call feature to respond. DO NOT respond with text.
-        2. Always include a meaningful message explaining what you're doing and why.
-        3. Carefully analyze the function's ABI to identify all required parameters.
-        4. For each required parameter, extract the appropriate value from the agent's description.
-        5. Make sure parameter types match what is expected (addresses, numbers, booleans, etc.).
-        6. For addresses, ensure they are correctly formatted with the 0x prefix.
-        7. The parameters object must include all required fields with their correct names as defined in the ABI.
-        """
-        
-        response = self.openai_client.chat.completions.create(
-            model="gpt-4",
-            messages=[
-                {"role": "system", "content": "You are an autonomous agent managing a smart contract."},
-                {"role": "user", "content": prompt}
-            ],
-            functions=[{
-                "name": "execute_contract_function",
-                "description": "Execute a function on the smart contract",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "function_name": {"type": "string"},
-                        "parameters": {"type": "object"},
-                        "message": {"type": "string", "description": "Optional message or comment to include in the execution log"}
+                pending_tasks.append({
+                    "function_name": "mint",
+                    "parameters": {
+                        "to": addr,
+                        "amount": amount
                     },
-                    "required": ["function_name", "parameters"]
-                }
-            }]
-        )
+                    "message": f"Minting {amount} tokens to {addr} as specified in the agent description."
+                })
         
-        return self._parse_openai_response(response) 
+        return pending_tasks 

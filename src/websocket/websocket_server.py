@@ -722,6 +722,138 @@ class WebSocketServer:
                 "execution_id": f"ws_{datetime.now().strftime('%Y%m%d%H%M%S')}"
             }
             
+            # Extraer parámetros de la descripción del agente
+            try:
+                if hasattr(agent, 'agent') and agent.agent and hasattr(agent.agent, 'description'):
+                    # Importar la función de análisis de descripción desde donde sea necesario
+                    # Esto es temporal - lo ideal sería tener esta función en una ubicación común
+                    import re
+                    
+                    def analyze_agent_description(description):
+                        """Analiza la descripción del agente para extraer parámetros relevantes"""
+                        params = {
+                            "addresses": [],
+                            "amounts": [],
+                            "functions": [],
+                            "conditions": [],
+                            "behaviors": []
+                        }
+                        
+                        # Extraer direcciones Ethereum
+                        address_pattern = r'0x[a-fA-F0-9]{40}'
+                        params["addresses"] = re.findall(address_pattern, description)
+                        
+                        # Extraer cantidades numéricas grandes
+                        amount_pattern = r'(\d{10,})'
+                        amount_matches = re.findall(amount_pattern, description)
+                        params["amounts"] = [int(amount) for amount in amount_matches]
+                        
+                        # Identificar nombres de funciones
+                        function_pattern = r'using\s+([a-zA-Z0-9_]+)|call\s+([a-zA-Z0-9_]+)|function\s+([a-zA-Z0-9_]+)|método\s+([a-zA-Z0-9_]+)'
+                        function_matches = re.findall(function_pattern, description, re.IGNORECASE)
+                        params["functions"] = [match[0] or match[1] or match[2] or match[3] for match in function_matches if any(match)]
+                        
+                        # Identificar condiciones
+                        condition_pattern = r'(?:if|when|si|cuando)\s+([^.,;]+)'
+                        params["conditions"] = re.findall(condition_pattern, description, re.IGNORECASE)
+                        
+                        # Detectar patrones de comportamiento
+                        if "check" in description.lower() or "verificar" in description.lower() or "comprobar" in description.lower():
+                            params["behaviors"].append("check")
+                        if "balance" in description.lower():
+                            params["behaviors"].append("check_balance")
+                        if "mint" in description.lower() or "crear" in description.lower() or "generar" in description.lower():
+                            params["behaviors"].append("mint")
+                        if "repeat" in description.lower() or "repetir" in description.lower() or "until" in description.lower() or "loop" in description.lower():
+                            params["behaviors"].append("repeat")
+                            
+                        return params
+                    
+                    def extract_parameters_for_function(function_name, function_abi, agent_params, function_type):
+                        """Extrae los parámetros adecuados para una función basado en su ABI y los parámetros extraídos"""
+                        params = {}
+                        
+                        if not function_abi or "inputs" not in function_abi:
+                            # Si no hay información ABI, intentar inferir parámetros por el nombre
+                            if function_name.lower() in ["balanceof", "balance"]:
+                                if agent_params["addresses"]:
+                                    params = {"account": agent_params["addresses"][0]}
+                                return params
+                            
+                            if function_name.lower() in ["mint", "transfer", "send"]:
+                                if agent_params["addresses"]:
+                                    params = {"to": agent_params["addresses"][0]}
+                                    if agent_params["amounts"]:
+                                        params["amount"] = agent_params["amounts"][0]
+                                return params
+                            
+                            return params
+                        
+                        # Procesar cada parámetro de entrada según el ABI
+                        for input_param in function_abi["inputs"]:
+                            param_name = input_param.get("name", "")
+                            param_type = input_param.get("type", "")
+                            
+                            # Parámetros de dirección (address)
+                            if param_type == "address" and param_name.lower() in ["to", "account", "owner", "recipient"]:
+                                if agent_params["addresses"]:
+                                    params[param_name] = agent_params["addresses"][0]
+                            
+                            # Parámetros de cantidad (uint)
+                            if param_type.startswith("uint") and param_name.lower() in ["amount", "value", "quantity"]:
+                                if agent_params["amounts"]:
+                                    # Para funciones mint, usar el segundo monto si está disponible
+                                    if function_name.lower() == "mint" and len(agent_params["amounts"]) > 1:
+                                        params[param_name] = agent_params["amounts"][1]
+                                    else:
+                                        params[param_name] = agent_params["amounts"][0]
+                        
+                        return params
+                    
+                    # Extraer parámetros y añadirlos al trigger_data
+                    extracted_params = analyze_agent_description(agent.agent.description)
+                    trigger_data["extracted_params"] = extracted_params
+                    
+                    # También preparar los parámetros para cada función
+                    if hasattr(agent, '_functions') and agent._functions:
+                        for func_name, func in agent._functions.items():
+                            if hasattr(func, 'abi') and func.abi:
+                                func_params = extract_parameters_for_function(
+                                    func.name, 
+                                    func.abi, 
+                                    extracted_params,
+                                    func.function_type
+                                )
+                                
+                                if hasattr(func, "extracted_params"):
+                                    func.extracted_params = func_params
+                                else:
+                                    setattr(func, "extracted_params", func_params)
+                                
+                                logger.info(f"Parámetros para {func.name}: {func_params}")
+                    
+                    # Añadir flag para completar todas las tareas
+                    trigger_data["complete_all_tasks"] = True
+                    
+                    # Aumentar el número máximo de ciclos
+                    trigger_data["max_cycles"] = 10
+                    
+                    # Log para depuración
+                    logger.info(f"Parámetros extraídos: {extracted_params}")
+                    execution_logs.append({
+                        "timestamp": datetime.now().isoformat(),
+                        "level": "info",
+                        "message": f"Parámetros extraídos de la descripción del agente"
+                    })
+                
+            except Exception as e:
+                logger.error(f"Error extrayendo parámetros: {str(e)}")
+                execution_logs.append({
+                    "timestamp": datetime.now().isoformat(),
+                    "level": "error",
+                    "message": f"Error extrayendo parámetros: {str(e)}"
+                })
+            
             # Enviar un mensaje de log informando que la ejecución comienza
             log_start = {
                 "type": "log",
