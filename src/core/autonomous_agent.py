@@ -452,6 +452,9 @@ class AutonomousAgent:
             # Obtener el estado actual del contrato
             state = self.agent.contract_state if self.agent and self.agent.contract_state else {}
             
+            # Verificar si debemos asegurar completar todas las tareas
+            complete_all_tasks = trigger_data.get('complete_all_tasks', False)
+            
             # Analizar el estado y determinar acciones iniciales
             actions = await self.analyze_state(state, trigger_data)
             
@@ -466,7 +469,7 @@ class AutonomousAgent:
             execution_history = []
             
             # Límite de ciclos para evitar loops infinitos
-            max_cycles = 5
+            max_cycles = trigger_data.get('max_cycles', 5) if complete_all_tasks else 5
             current_cycle = 0
             
             # Bucle para ejecutar acciones y analizar resultados
@@ -577,6 +580,84 @@ class AutonomousAgent:
                 
                 functions_info.append(function_info)
         
+        # Verificar si debemos completar todas las tareas según la descripción del agente
+        complete_all_tasks = trigger_data.get('complete_all_tasks', False)
+        
+        # Extraer las funciones ya ejecutadas
+        executed_functions = [history_item.get('function') for history_item in execution_history]
+        
+        # Extraer los resultados específicos de lecturas y acciones importantes
+        domain_separator_result = None
+        admin_role_result = None
+        
+        # Crear tracking de direcciones que ya recibieron minteo
+        minted_addresses = set()
+        
+        for r in execution_history:
+            if r.get('function') == "DOMAIN_SEPARATOR" and 'result' in r and isinstance(r['result'], dict) and 'data' in r['result']:
+                domain_separator_result = r['result']['data']
+            elif r.get('function') == "ADMIN_ROLE" and 'result' in r and isinstance(r['result'], dict) and 'data' in r['result']:
+                admin_role_result = r['result']['data']
+            elif r.get('function') == "mint" and 'params' in r and 'to' in r['params']:
+                minted_addresses.add(r['params']['to'])
+        
+        # Extraer las direcciones esperadas de la descripción
+        description = self.agent.description.lower()
+        expected_addresses = []
+        
+        # Buscar direcciones Ethereum en la descripción
+        address_pattern = r'0x[a-fA-F0-9]{40}'
+        addresses_in_description = re.findall(address_pattern, self.agent.description)
+        if addresses_in_description:
+            expected_addresses = addresses_in_description
+        
+        # Definir tareas pendientes basadas en la descripción y lo ya ejecutado
+        pending_tasks = []
+        
+        # Si no se ha ejecutado DOMAIN_SEPARATOR y está en la descripción
+        if "domain_separator" in description.lower() and "DOMAIN_SEPARATOR" not in executed_functions:
+            pending_tasks.append({
+                "function": "DOMAIN_SEPARATOR",
+                "params": {},
+                "message": "Getting the domain separator data as described in the behavior."
+            })
+        
+        # Si no se ha ejecutado ADMIN_ROLE y está en la descripción
+        if ("admin_role" in description.lower() or "admind role" in description.lower()) and "ADMIN_ROLE" not in executed_functions:
+            pending_tasks.append({
+                "function": "ADMIN_ROLE",
+                "params": {},
+                "message": "Reading the ADMIN_ROLE value as required in the agent description."
+            })
+        
+        # Mintear tokens a direcciones mencionadas que aún no se han procesado
+        for addr in expected_addresses:
+            if addr not in minted_addresses and "mint" in description.lower():
+                # Busca un valor específico para mintear en la descripción cerca de esta dirección
+                amount_pattern = r'(\d+)(?:\s+tokenes|\s+tokens)'
+                amounts = re.findall(amount_pattern, description.lower())
+                amount = 5000000  # Valor por defecto
+                
+                if amounts:
+                    try:
+                        amount = int(amounts[0])
+                    except ValueError:
+                        pass
+                
+                pending_tasks.append({
+                    "function": "mint",
+                    "params": {
+                        "to": addr,
+                        "amount": amount
+                    },
+                    "message": f"Minting {amount} tokens to {addr} as specified in the agent description."
+                })
+        
+        # Solo devolver tareas pendientes si estamos en modo de completar todas las tareas o es el primer ciclo
+        if complete_all_tasks and pending_tasks:
+            return pending_tasks
+        
+        # Si ya no hay tareas pendientes o no estamos en modo completar todas, ejecutar la lógica normal
         prompt = f"""
         Current contract state:
         {json.dumps(state, indent=2)}
@@ -596,11 +677,34 @@ class AutonomousAgent:
         Previous execution results:
         {json.dumps(execution_history, indent=2)}
         
+        Functions already executed:
+        {json.dumps(executed_functions, indent=2)}
+        
         Based on the previous execution results, the current state, and the agent's behavior description,
         determine if additional actions are needed.
         
+        {'IMPORTANT: You MUST complete ALL tasks specified in the agent description. The agent description mentions specific tasks that should be executed.' if complete_all_tasks else ''}
+        
         If the previous results indicate that further actions are required according to the agent's description,
         return those actions as function calls with appropriate parameters.
+        
+        If the agent's description mentions:
+        1. Reading DOMAIN_SEPARATOR, ensure this function has been executed
+        2. Reading ADMIN_ROLE, ensure this function has been executed
+        3. Creating a log with both results, ensure this has been done
+        4. Minting tokens for specific addresses, ensure these operations have been executed
+        
+        {'Carefully check the functions already executed and compare them to what is required in the agent description. Make sure ALL required tasks are completed.' if complete_all_tasks else ''}
+        
+        Based on the execution history, here is the current status of required tasks:
+        - DOMAIN_SEPARATOR read: {'Yes' if domain_separator_result else 'No'}
+        - ADMIN_ROLE read: {'Yes' if admin_role_result else 'No'}
+        - Minted addresses so far: {list(minted_addresses)}
+        - Expected addresses in description: {expected_addresses}
+        - Addresses not yet minted: {[addr for addr in expected_addresses if addr not in minted_addresses]}
+        
+        Analyze the execution history and return ONLY the remaining actions needed to complete ALL tasks 
+        mentioned in the agent description. Be thorough and make sure you don't miss any required tasks.
         
         If no further actions are needed, respond with an empty array.
         
@@ -639,158 +743,177 @@ class AutonomousAgent:
         Remember: You have full authority and responsibility to decide appropriate parameter values based on context.
         """
         
-        response = self.openai_client.chat.completions.create(
-            model="gpt-4",
-            messages=[
-                {"role": "system", "content": "You are an autonomous agent managing a smart contract. You generate appropriate parameter values for function calls based on context and function specifications."},
-                {"role": "user", "content": prompt}
-            ],
-            functions=[{
-                "name": "execute_contract_function",
-                "description": "Execute a function on the smart contract",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "function_name": {"type": "string"},
-                        "parameters": {"type": "object"},
-                        "message": {"type": "string", "description": "Optional message or comment to include in the execution log"}
-                    },
-                    "required": ["function_name", "parameters", "message"]
-                }
-            }]
-        )
-        
-        return self._parse_openai_response(response)
+        # Enviar consulta al modelo de OpenAI solo si no tenemos tareas pendientes predefinidas
+        try:
+            response = self.openai_client.chat.completions.create(
+                model="gpt-4",
+                messages=[
+                    {"role": "system", "content": "You are an autonomous agent managing a smart contract. You generate appropriate parameter values for function calls based on context and function specifications."},
+                    {"role": "user", "content": prompt}
+                ],
+                tools=[{
+                    "type": "function",
+                    "function": {
+                        "name": "execute_functions",
+                        "description": "Execute functions on the smart contract",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "functions": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "function_name": {"type": "string", "description": "Name of the function to execute"},
+                                            "parameters": {"type": "object", "description": "Parameters for the function"},
+                                            "message": {"type": "string", "description": "Optional message or comment to include in the execution log"}
+                                        },
+                                        "required": ["function_name", "parameters", "message"]
+                                    }
+                                }
+                            },
+                            "required": ["functions"]
+                        }
+                    }
+                }]
+            )
+            
+            # Procesar la respuesta
+            return self._parse_openai_response(response)
+            
+        except Exception as e:
+            logger.error(f"Error calling OpenAI API: {str(e)}")
+            # Si hay un error con la API, pero tenemos tareas pendientes, devolver esas
+            if pending_tasks:
+                return pending_tasks
+            return []
 
     def _parse_openai_response(self, response) -> List[Dict]:
         """
-        Parsea la respuesta de OpenAI para extraer acciones
+        Parsea la respuesta de OpenAI para extraer las acciones a ejecutar
         
-        Returns:
-            Lista de acciones con los campos 'function', 'params' y opcionalmente 'message'
-        """
-        try:
-            # Verificar si hay una llamada a función en la respuesta
-            if response.choices[0].message.function_call:
-                function_call = response.choices[0].message.function_call
-                
-                # Si es una llamada a execute_contract_function, extraer los datos
-                if function_call.name == "execute_contract_function":
-                    args = json.loads(function_call.arguments)
-                    function_name = args.get("function_name")
-                    parameters = args.get("parameters", {})
-                    
-                    # Crear la acción en el formato esperado
-                    action = {
-                        "function": function_name,
-                        "params": parameters
-                    }
-                    
-                    # Incluir mensaje si está presente
-                    if "message" in args:
-                        action["message"] = args["message"]
-                    else:
-                        # Generar un mensaje genérico si no se proporcionó uno
-                        action["message"] = f"Executing function {function_name} with parameters {json.dumps(parameters)}"
-                        
-                    return [action]  # Devolver como lista
+        Args:
+            response: Respuesta de OpenAI
             
-            # Si no hay llamada a función, intentar parsear del contenido
-            content = response.choices[0].message.content
-            if not content:
+        Returns:
+            Lista de acciones a ejecutar
+        """
+        actions = []
+        
+        try:
+            # Obtener el primer mensaje del asistente
+            if not response or not hasattr(response, 'choices') or not response.choices:
+                logger.warning("OpenAI response is empty or missing 'choices'")
                 return []
                 
-            # Intentar extraer acciones en formato JSON
-            try:
-                # Buscar el patrón ```json ... ``` para extraer las acciones
-                json_pattern = r"```json\s*([\s\S]*?)\s*```"
-                match = re.search(json_pattern, content)
+            choice = response.choices[0]
+            if not hasattr(choice, 'message'):
+                logger.warning("OpenAI response choice is missing 'message'")
+                return []
                 
-                if match:
-                    json_str = match.group(1)
-                    actions = json.loads(json_str)
-                    
-                    # Si es un único diccionario, convertirlo a lista
-                    if isinstance(actions, dict):
-                        actions = [actions]
-                    
-                    # Validar estructura de acciones y asegurar campos requeridos
-                    validated_actions = []
-                    for action in actions:
-                        if "function" in action and isinstance(action, dict):
-                            function_name = action["function"]
-                            original_params = action.get("params", {})
+            message = choice.message
+            
+            # Verificar si hay una herramienta llamada
+            if hasattr(message, 'tool_calls') and message.tool_calls:
+                logger.info(f"Found tool_calls in response: {len(message.tool_calls)}")
+                
+                for tool_call in message.tool_calls:
+                    try:
+                        if hasattr(tool_call, 'function') and tool_call.function:
+                            function_data = tool_call.function
                             
-                            # Completar parámetros faltantes
-                            completed_params = self._complete_missing_parameters(function_name, original_params)
-                            
-                            validated_action = {
-                                "function": function_name,
-                                "params": completed_params
-                            }
-                            
-                            # Incluir el mensaje si está presente
-                            if "message" in action:
-                                validated_action["message"] = action["message"]
-                            else:
-                                # Generar un mensaje genérico
-                                validated_action["message"] = f"Executing function {function_name} with parameters {json.dumps(completed_params)}"
+                            # Para el formato de execute_functions que devuelve una lista
+                            if function_data.name == 'execute_functions':
+                                args = json.loads(function_data.arguments)
                                 
-                            validated_actions.append(validated_action)
+                                if 'functions' in args and isinstance(args['functions'], list):
+                                    for func_info in args['functions']:
+                                        action = {
+                                            'function': func_info.get('function_name'),
+                                            'params': func_info.get('parameters', {}),
+                                            'message': func_info.get('message', '')
+                                        }
+                                        actions.append(action)
+                            
+                            # Para el formato antiguo de función directa
+                            else:
+                                args = json.loads(function_data.arguments)
+                                action = {
+                                    'function': function_data.name,
+                                    'params': args,
+                                    'message': args.get('message', '')
+                                }
+                                actions.append(action)
+                                
+                    except Exception as e:
+                        logger.error(f"Error parsing tool call: {str(e)}")
+            
+            # Verificar formato antiguo de function_call
+            elif hasattr(message, 'function_call') and message.function_call:
+                function_call = message.function_call
+                
+                try:
+                    args = json.loads(function_call.arguments)
                     
-                    return validated_actions
-            except Exception as json_err:
-                logger.warning(f"Error parsing JSON from OpenAI response: {str(json_err)}")
+                    # Para el formato de execute_functions que devuelve una lista
+                    if function_call.name == 'execute_functions':
+                        if 'functions' in args and isinstance(args['functions'], list):
+                            for func_info in args['functions']:
+                                action = {
+                                    'function': func_info.get('function_name'),
+                                    'params': func_info.get('parameters', {}),
+                                    'message': func_info.get('message', '')
+                                }
+                                actions.append(action)
+                    
+                    # Para el formato antiguo de llamada directa
+                    else:
+                        action = {
+                            'function': function_call.name,
+                            'params': args,
+                            'message': args.get('message', '')
+                        }
+                        actions.append(action)
+                
+                except Exception as e:
+                    logger.error(f"Error parsing function call: {str(e)}")
             
-            # Si no se pudo extraer JSON, intentar hacer parsing de texto
-            logger.info("Attempting to parse actions from plain text")
+            # Si no hay tool_calls ni function_call, verificar si hay un mensaje de texto con un formato específico
+            elif hasattr(message, 'content') and message.content:
+                content = message.content.strip()
+                
+                # Intentar buscar funciones en el texto
+                if content:
+                    try:
+                        # Verificar si parece un JSON
+                        if content.startswith('{') and content.endswith('}') or content.startswith('[') and content.endswith(']'):
+                            data = json.loads(content)
+                            
+                            # Si es un objeto, convertirlo a lista
+                            if isinstance(data, dict):
+                                data = [data]
+                            
+                            # Procesar lista de acciones
+                            if isinstance(data, list):
+                                for item in data:
+                                    if isinstance(item, dict) and 'function' in item:
+                                        action = {
+                                            'function': item.get('function'),
+                                            'params': item.get('params', {}),
+                                            'message': item.get('message', '')
+                                        }
+                                        actions.append(action)
+                    
+                    except json.JSONDecodeError:
+                        logger.warning(f"Could not parse message content as JSON: {content}")
             
-            # Buscar patrones de llamadas a funciones en el texto
-            function_pattern = r"(?:Execute|Call|Run|Invoke|Use)\s+(?:function|method)?\s*['\"]?(\w+)['\"]?"
-            function_matches = re.finditer(function_pattern, content, re.IGNORECASE)
+            logger.info(f"Parsed {len(actions)} actions from OpenAI response")
             
-            actions = []
-            for match in function_matches:
-                function_name = match.group(1)
-                
-                # Buscar la función en las funciones disponibles
-                matching_function = None
-                for func in self.functions:
-                    if func.function_name == function_name:
-                        matching_function = func
-                        break
-                
-                if not matching_function:
-                    continue
-                
-                # Extraer parámetros del texto o completarlos basados en el ABI
-                params = self._extract_params_from_text(content, matching_function)
-                
-                # Generar un mensaje basado en el texto o un mensaje genérico
-                message_match = re.search(r"(?:Mensaje|Message|Comentario|Comment):\s*(.+?)(?=\n\n|\n(?:Execute|Call|Run|Invoke|Use)|\Z)", 
-                                         content[match.end():], re.IGNORECASE)
-                message = message_match.group(1).strip() if message_match else f"Executing {function_name} based on agent description"
-                
-                # Crear acción
-                action = {
-                    "function": function_name,
-                    "params": params,
-                    "message": message
-                }
-                
-                actions.append(action)
-            
-            # Si no se encontraron acciones en el texto pero hay una descripción clara,
-            # intentar inferir acciones basadas en la descripción del agente
-            if not actions and self.agent and self.agent.description:
-                actions = self._infer_actions_from_description()
-            
-            return actions
-                
         except Exception as e:
-            logger.error(f"Error parsing OpenAI response: {str(e)}")
-            return []
-            
+            logger.error(f"Error in _parse_openai_response: {str(e)}")
+        
+        return actions
+
     def _complete_missing_parameters(self, function_name: str, provided_params: Dict) -> Dict:
         """
         Completa parámetros faltantes para una función basándose en la descripción del agente.
